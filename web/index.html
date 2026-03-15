@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en" class="dark">
+    <head>
+        <meta charset="UTF-8" />
+        <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>CLIProxyAPI Dashboard</title>
+        <link href="/fonts/inter.css" rel="stylesheet" />
+        <link href="/fonts/material-symbols-outlined.css" rel="stylesheet" />
+        <script type="module">
+            if (import.meta.env.DEV) {
+                import("react-grab");
+            }
+        </script>
+    </head>
+    <body class="bg-background-light dark:bg-background-dark text-slate-900 dark:text-white font-display">
+        <div id="root"></div>
+        <script type="module" src="/src/main.tsx"></script>
+    </body>
+</html>

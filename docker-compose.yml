@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: "cpab-postgres"
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cpab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insecure-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-cpab}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cpab} -d ${POSTGRES_DB:-cpab}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cpab:
+    image: abwebplode/cpab:latest
+    pull_policy: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: "cpab"
+    restart: unless-stopped
+    environment:
+      # Construct connection string from individual variables
+      DB_CONNECTION: "postgres://${POSTGRES_USER:-cpab}:${POSTGRES_PASSWORD:-insecure-change-me}@postgres:5432/${POSTGRES_DB:-cpab}?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET:-insecure-jwt-secret-change-me}
+      JWT_EXPIRY: ${JWT_EXPIRY:-720h}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8318:8318"
+    working_dir: /CLIProxyAPIBusiness
+    command: ./cpab
