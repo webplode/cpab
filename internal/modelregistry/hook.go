@@ -3,6 +3,7 @@ package modelregistry
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
@@ -15,6 +16,7 @@ import (
 type Hook struct {
 	db    *gorm.DB
 	store *Store
+	mu    sync.Mutex
 }
 
 // NewHook constructs a Hook with an optional store.
@@ -44,6 +46,12 @@ func (h *Hook) OnModelsRegistered(ctx context.Context, provider, clientID string
 	if h.db == nil {
 		return
 	}
+
+	// Serialize DB seeding to prevent race conditions when multiple auth keys
+	// trigger concurrent goroutines that all see "no existing mappings" and
+	// create duplicates.
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
 	if normalizedProvider == "" {
