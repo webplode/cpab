@@ -294,7 +294,7 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
     const [userGroupBtnWidth, setUserGroupBtnWidth] = useState<number | undefined>(undefined);
 
     const providerBtnRef = useRef<HTMLButtonElement>(null);
-    const modelBtnRef = useRef<HTMLButtonElement>(null);
+    const modelBtnRef = useRef<HTMLInputElement>(null);
     const selectorBtnRef = useRef<HTMLButtonElement>(null);
 
     useEffect(() => {
@@ -421,30 +421,46 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
                             {t('Model')}
                         </label>
                         <div className="relative">
-                            <button
-                                ref={modelBtnRef}
-                                type="button"
-                                disabled={!provider || loadingModels || !canLoadModels}
-                                onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
-                                className="w-full flex items-center justify-between px-4 py-2.5 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                <span className={modelName ? '' : 'text-gray-400'}>
-                                    {!canLoadModels
-                                        ? t('No permission to load models')
-                                        : loadingModels
-                                            ? t('Loading...')
-                                            : modelName || t('Select Model')}
-                                </span>
-                                <Icon
-                                    name={loadingModels ? 'progress_activity' : 'expand_more'}
-                                    size={18}
-                                    className={loadingModels ? 'animate-spin' : ''}
+                            <div className="relative">
+                                <input
+                                    ref={modelBtnRef}
+                                    type="text"
+                                    value={modelName}
+                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    onChange={(e) => {
+                                        setModelName(e.target.value);
+                                        if (!modelDropdownOpen) setModelDropdownOpen(true);
+                                    }}
+                                    onFocus={() => { if (models.length > 0) setModelDropdownOpen(true); }}
+                                    placeholder={
+                                        !canLoadModels
+                                            ? t('No permission to load models')
+                                            : loadingModels
+                                                ? t('Loading...')
+                                                : t('Type or select model')
+                                    }
+                                    className="w-full px-4 py-2.5 pr-9 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
                                 />
-                            </button>
+                                <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
+                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
+                                >
+                                    <Icon
+                                        name={loadingModels ? 'progress_activity' : 'expand_more'}
+                                        size={18}
+                                        className={loadingModels ? 'animate-spin' : ''}
+                                    />
+                                </button>
+                            </div>
                             {modelDropdownOpen && models.length > 0 && (
                                 <DropdownPortal
                                     anchorRef={modelBtnRef}
-                                    options={models.map((m) => ({ label: m, value: m }))}
+                                    options={models
+                                        .filter((m) => !modelName || m.toLowerCase().includes(modelName.toLowerCase()))
+                                        .map((m) => ({ label: m, value: m }))}
                                     selected={modelName}
                                     onSelect={(val) => {
                                         setModelName(val);
@@ -661,7 +677,7 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
     const [userGroupBtnWidth, setUserGroupBtnWidth] = useState<number | undefined>(undefined);
 
     const providerBtnRef = useRef<HTMLButtonElement>(null);
-    const modelBtnRef = useRef<HTMLButtonElement>(null);
+    const modelBtnRef = useRef<HTMLInputElement>(null);
     const selectorBtnRef = useRef<HTMLButtonElement>(null);
 
     useEffect(() => {
@@ -796,30 +812,46 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
                             {t('Model')}
                         </label>
                         <div className="relative">
-                            <button
-                                ref={modelBtnRef}
-                                type="button"
-                                disabled={!provider || loadingModels || !canLoadModels}
-                                onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
-                                className="w-full flex items-center justify-between px-4 py-2.5 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                <span className={modelName ? '' : 'text-gray-400'}>
-                                    {!canLoadModels
-                                        ? t('No permission to load models')
-                                        : loadingModels
-                                            ? t('Loading...')
-                                            : modelName || t('Select Model')}
-                                </span>
-                                <Icon
-                                    name={loadingModels ? 'progress_activity' : 'expand_more'}
-                                    size={18}
-                                    className={loadingModels ? 'animate-spin' : ''}
+                            <div className="relative">
+                                <input
+                                    ref={modelBtnRef}
+                                    type="text"
+                                    value={modelName}
+                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    onChange={(e) => {
+                                        setModelName(e.target.value);
+                                        if (!modelDropdownOpen) setModelDropdownOpen(true);
+                                    }}
+                                    onFocus={() => { if (models.length > 0) setModelDropdownOpen(true); }}
+                                    placeholder={
+                                        !canLoadModels
+                                            ? t('No permission to load models')
+                                            : loadingModels
+                                                ? t('Loading...')
+                                                : t('Type or select model')
+                                    }
+                                    className="w-full px-4 py-2.5 pr-9 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
                                 />
-                            </button>
+                                <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
+                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
+                                >
+                                    <Icon
+                                        name={loadingModels ? 'progress_activity' : 'expand_more'}
+                                        size={18}
+                                        className={loadingModels ? 'animate-spin' : ''}
+                                    />
+                                </button>
+                            </div>
                             {modelDropdownOpen && models.length > 0 && (
                                 <DropdownPortal
                                     anchorRef={modelBtnRef}
-                                    options={models.map((m) => ({ label: m, value: m }))}
+                                    options={models
+                                        .filter((m) => !modelName || m.toLowerCase().includes(modelName.toLowerCase()))
+                                        .map((m) => ({ label: m, value: m }))}
                                     selected={modelName}
                                     onSelect={(val) => {
                                         setModelName(val);
