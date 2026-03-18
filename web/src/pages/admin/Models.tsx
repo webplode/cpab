@@ -1034,7 +1034,7 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
 }
 
 interface DropdownPortalProps {
-    anchorRef: React.RefObject<HTMLButtonElement | null>;
+    anchorRef: React.RefObject<HTMLElement | null>;
     options: { label: string; value: string }[];
     selected: string;
     onSelect: (value: string) => void;
