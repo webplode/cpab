@@ -822,6 +822,10 @@ func migratePostgres(conn *gorm.DB) error {
 		}
 	}
 
+	if errDedup := deduplicateModelMappings(conn); errDedup != nil {
+		return errDedup
+	}
+
 	return nil
 }
 
@@ -1173,6 +1177,10 @@ func migrateSQLite(conn *gorm.DB) error {
 		if errDDL := conn.Exec(item.sql).Error; errDDL != nil {
 			return fmt.Errorf("db: create index %s: %w", item.name, errDDL)
 		}
+	}
+
+	if errDedup := deduplicateModelMappings(conn); errDedup != nil {
+		return errDedup
 	}
 
 	return nil
@@ -1597,6 +1605,41 @@ func migrateUserGroupIDsSQLite(conn *gorm.DB) error {
 		WHERE user_group_id IS NULL
 	`).Error; errUpdate != nil {
 		return fmt.Errorf("db: backfill bill user group ids: %w", errUpdate)
+	}
+	return nil
+}
+
+// deduplicateModelMappings removes duplicate auto-seeded identity model mappings,
+// keeping only the row with the lowest ID for each (provider, model_name, new_model_name)
+// combination that shares the same user_group_id value.
+func deduplicateModelMappings(conn *gorm.DB) error {
+	if conn == nil {
+		return nil
+	}
+	dialect := DialectName(conn)
+	var sql string
+	switch dialect {
+	case DialectPostgres:
+		sql = `
+			DELETE FROM model_mappings
+			WHERE id NOT IN (
+				SELECT MIN(id)
+				FROM model_mappings
+				GROUP BY provider, LOWER(model_name), LOWER(new_model_name), COALESCE(user_group_id::text, '')
+			)
+		`
+	default:
+		sql = `
+			DELETE FROM model_mappings
+			WHERE id NOT IN (
+				SELECT MIN(id)
+				FROM model_mappings
+				GROUP BY provider, LOWER(model_name), LOWER(new_model_name), COALESCE(user_group_id, '')
+			)
+		`
+	}
+	if errDedup := conn.Exec(sql).Error; errDedup != nil {
+		return fmt.Errorf("db: deduplicate model mappings: %w", errDedup)
 	}
 	return nil
 }
