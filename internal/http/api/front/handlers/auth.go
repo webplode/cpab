@@ -48,6 +48,10 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing password"})
 		return
 	}
+	if errValidate := security.ValidatePassword(password); errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+		return
+	}
 
 	var exists models.User
 	if errCheck := h.db.WithContext(c.Request.Context()).Where("username = ?", username).First(&exists).Error; errCheck == nil {
@@ -131,59 +135,35 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	if strings.TrimSpace(user.TOTPSecret) != "" || len(user.PasskeyID) > 0 || len(user.PasskeyPublicKey) > 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "mfa required"})
+	if methods := userMFAMethods(user); len(methods) > 0 {
+		pendingToken, errToken := security.GeneratePendingMFAToken(h.jwtCfg.Secret, user.ID, user.Username)
+		if errToken != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate mfa token"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"mfa_required": true,
+			"mfa_token":    pendingToken,
+			"mfa_methods":  methods,
+		})
 		return
 	}
 
 	h.respondWithUserToken(c, user)
 }
 
-// resetPasswordRequest defines the request body for password resets.
-type resetPasswordRequest struct {
-	Username    string `json:"username"`
-	Email       string `json:"email"`
-	NewPassword string `json:"new_password"`
+// ResetPassword is a backward-compatible alias for the authenticated password-change flow.
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	NewProfileHandler(h.db).ChangePassword(c)
 }
 
-// ResetPassword updates a user's password after verification.
-func (h *AuthHandler) ResetPassword(c *gin.Context) {
-	var body resetPasswordRequest
-	if errBind := c.ShouldBindJSON(&body); errBind != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
-		return
+func userMFAMethods(user models.User) []string {
+	methods := make([]string, 0, 2)
+	if strings.TrimSpace(user.TOTPSecret) != "" {
+		methods = append(methods, "totp")
 	}
-	username := strings.TrimSpace(body.Username)
-	email := strings.TrimSpace(body.Email)
-	newPassword := strings.TrimSpace(body.NewPassword)
-	if username == "" || email == "" || newPassword == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing required fields"})
-		return
+	if len(user.PasskeyID) > 0 && len(user.PasskeyPublicKey) > 0 {
+		methods = append(methods, "passkey")
 	}
-
-	var user models.User
-	if errFind := h.db.WithContext(c.Request.Context()).Where("username = ? AND email = ?", username, email).First(&user).Error; errFind != nil {
-		if errors.Is(errFind, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
-		return
-	}
-
-	hash, errHash := security.HashPassword(newPassword)
-	if errHash != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "hash password failed"})
-		return
-	}
-
-	if errUpdate := h.db.WithContext(c.Request.Context()).Model(&user).Updates(map[string]any{
-		"password":   hash,
-		"updated_at": time.Now().UTC(),
-	}).Error; errUpdate != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "reset password failed"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	return methods
 }

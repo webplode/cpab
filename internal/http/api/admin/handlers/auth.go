@@ -56,15 +56,35 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	if strings.TrimSpace(admin.TOTPSecret) != "" || len(admin.PasskeyID) > 0 || len(admin.PasskeyPublicKey) > 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "mfa required"})
-		return
-	}
-
 	if !security.CheckPassword(admin.Password, password) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
 
+	if methods := adminMFAMethods(admin); len(methods) > 0 {
+		pendingToken, errToken := security.GeneratePendingMFAToken(h.jwtCfg.Secret, admin.ID, admin.Username)
+		if errToken != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate mfa token"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"mfa_required": true,
+			"mfa_token":    pendingToken,
+			"mfa_methods":  methods,
+		})
+		return
+	}
+
 	h.respondWithAdminToken(c, admin)
+}
+
+func adminMFAMethods(admin models.Admin) []string {
+	methods := make([]string, 0, 2)
+	if strings.TrimSpace(admin.TOTPSecret) != "" {
+		methods = append(methods, "totp")
+	}
+	if len(admin.PasskeyID) > 0 && len(admin.PasskeyPublicKey) > 0 {
+		methods = append(methods, "passkey")
+	}
+	return methods
 }

@@ -2,11 +2,15 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image/png"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -27,6 +31,15 @@ import (
 type MFAHandler struct {
 	db       *gorm.DB
 	webAuthn *webauthn.WebAuthn
+}
+
+const (
+	loginPrepareMinDelay = 50 * time.Millisecond
+	loginPrepareMaxDelay = 200 * time.Millisecond
+)
+
+var loginPrepareDelay = func() {
+	time.Sleep(randomLoginPrepareDelay())
 }
 
 // NewMFAHandler constructs an MFAHandler.
@@ -510,33 +523,58 @@ func (h *AuthHandler) LoginPrepare(c *gin.Context) {
 		return
 	}
 
+	loginPrepareDelay()
+
 	var admin models.Admin
 	if errFind := h.db.WithContext(c.Request.Context()).
 		Select("id", "username", "active", "totp_secret", "passkey_id", "passkey_public_key").
 		Where("username = ?", username).
 		First(&admin).Error; errFind != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		if errors.Is(errFind, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusOK, loginPrepareStatusResponse(false, false))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
 	}
-	if !admin.Active {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin account is disabled"})
+	if !admin.Active || !constantTimeUsernameMatch(admin.Username, username) {
+		c.JSON(http.StatusOK, loginPrepareStatusResponse(false, false))
 		return
 	}
 
 	totpEnabled := strings.TrimSpace(admin.TOTPSecret) != ""
 	passkeyEnabled := len(admin.PasskeyID) > 0 && len(admin.PasskeyPublicKey) > 0
-	mfaEnabled := totpEnabled || passkeyEnabled
+	c.JSON(http.StatusOK, loginPrepareStatusResponse(totpEnabled, passkeyEnabled))
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"mfa_enabled":     mfaEnabled,
+func loginPrepareStatusResponse(totpEnabled, passkeyEnabled bool) gin.H {
+	return gin.H{
+		"mfa_enabled":     totpEnabled || passkeyEnabled,
 		"totp_enabled":    totpEnabled,
 		"passkey_enabled": passkeyEnabled,
-	})
+	}
+}
+
+func constantTimeUsernameMatch(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func randomLoginPrepareDelay() time.Duration {
+	minMs := int64(loginPrepareMinDelay / time.Millisecond)
+	spanMs := int64((loginPrepareMaxDelay - loginPrepareMinDelay) / time.Millisecond)
+	if spanMs <= 0 {
+		return loginPrepareMinDelay
+	}
+	offset, err := rand.Int(rand.Reader, big.NewInt(spanMs+1))
+	if err != nil {
+		return loginPrepareMinDelay
+	}
+	return time.Duration(minMs+offset.Int64()) * time.Millisecond
 }
 
 // loginTotpRequest defines the request body for TOTP login.
 type loginTotpRequest struct {
-	Username string `json:"username"`
+	MFAToken string `json:"mfa_token"`
 	Code     string `json:"code"`
 }
 
@@ -547,18 +585,16 @@ func (h *AuthHandler) LoginTOTP(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
-	username := strings.TrimSpace(body.Username)
+	mfaToken := strings.TrimSpace(body.MFAToken)
 	code := strings.TrimSpace(body.Code)
-	if username == "" || code == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "username and code are required"})
+	if code == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
 		return
 	}
 
-	var admin models.Admin
-	if errFind := h.db.WithContext(c.Request.Context()).
-		Where("username = ?", username).
-		First(&admin).Error; errFind != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+	admin, errPending := h.loadPendingMFAAdmin(c, mfaToken)
+	if errPending != nil {
+		respondPendingMFAError(c, errPending)
 		return
 	}
 	if !admin.Active {
@@ -579,7 +615,7 @@ func (h *AuthHandler) LoginTOTP(c *gin.Context) {
 
 // loginPasskeyRequest defines the request body for passkey login options.
 type loginPasskeyRequest struct {
-	Username string `json:"username"`
+	MFAToken string `json:"mfa_token"`
 }
 
 // LoginPasskeyOptions starts a passkey login ceremony.
@@ -590,22 +626,19 @@ func (h *AuthHandler) LoginPasskeyOptions(c *gin.Context) {
 		return
 	}
 
-	var body loginPasskeyRequest
-	if errBind := c.ShouldBindJSON(&body); errBind != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
-		return
-	}
-	username := strings.TrimSpace(body.Username)
-	if username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "username is required"})
-		return
+	mfaToken := strings.TrimSpace(c.Query("mfa_token"))
+	if mfaToken == "" {
+		var body loginPasskeyRequest
+		if errBind := c.ShouldBindJSON(&body); errBind != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+			return
+		}
+		mfaToken = strings.TrimSpace(body.MFAToken)
 	}
 
-	var admin models.Admin
-	if errFind := h.db.WithContext(c.Request.Context()).
-		Select("id", "username", "password", "active", "passkey_id", "passkey_public_key", "passkey_sign_count", "passkey_backup_eligible", "passkey_backup_state", "permissions", "is_super_admin").
-		Where("username = ?", username).First(&admin).Error; errFind != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+	admin, errPending := h.loadPendingMFAAdmin(c, mfaToken)
+	if errPending != nil {
+		respondPendingMFAError(c, errPending)
 		return
 	}
 	if !admin.Active {
@@ -624,7 +657,7 @@ func (h *AuthHandler) LoginPasskeyOptions(c *gin.Context) {
 		return
 	}
 
-	passkeyLoginSessions.Set(username, *session)
+	passkeyLoginSessions.Set(mfaToken, *session)
 	c.JSON(http.StatusOK, assertion)
 }
 
@@ -636,17 +669,10 @@ func (h *AuthHandler) LoginPasskeyVerify(c *gin.Context) {
 		return
 	}
 
-	username := strings.TrimSpace(c.Query("username"))
-	if username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "username is required"})
-		return
-	}
-
-	var admin models.Admin
-	if errFind := h.db.WithContext(c.Request.Context()).
-		Select("id", "username", "active", "passkey_id", "passkey_public_key", "passkey_sign_count", "passkey_backup_eligible", "passkey_backup_state", "permissions", "is_super_admin").
-		Where("username = ?", username).First(&admin).Error; errFind != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+	mfaToken := strings.TrimSpace(c.Query("mfa_token"))
+	admin, errPending := h.loadPendingMFAAdmin(c, mfaToken)
+	if errPending != nil {
+		respondPendingMFAError(c, errPending)
 		return
 	}
 	if !admin.Active {
@@ -658,7 +684,7 @@ func (h *AuthHandler) LoginPasskeyVerify(c *gin.Context) {
 		return
 	}
 
-	session, ok := passkeyLoginSessions.Get(username)
+	session, ok := passkeyLoginSessions.Get(mfaToken)
 	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "login expired"})
 		return
@@ -676,7 +702,7 @@ func (h *AuthHandler) LoginPasskeyVerify(c *gin.Context) {
 	if admin.PasskeyBackupEligible == nil || admin.PasskeyBackupState == nil {
 		parsed, errParse := protocol.ParseCredentialRequestResponseBytes(rawBody)
 		if errParse != nil {
-			log.WithError(errParse).WithField("username", username).Warn("passkey login parse failed")
+			log.WithError(errParse).WithField("username", admin.Username).Warn("passkey login parse failed")
 		} else {
 			backupEligible := parsed.Response.AuthenticatorData.Flags.HasBackupEligible()
 			backupState := parsed.Response.AuthenticatorData.Flags.HasBackupState()
@@ -692,7 +718,7 @@ func (h *AuthHandler) LoginPasskeyVerify(c *gin.Context) {
 	}
 	credential, err := webAuthn.FinishLogin(user, session, c.Request)
 	if err != nil {
-		log.WithError(err).WithField("username", username).Warn("passkey login failed")
+		log.WithError(err).WithField("username", admin.Username).Warn("passkey login failed")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "login failed"})
 		return
 	}
@@ -707,8 +733,38 @@ func (h *AuthHandler) LoginPasskeyVerify(c *gin.Context) {
 			"updated_at":              time.Now().UTC(),
 		}).Error
 
-	passkeyLoginSessions.Delete(username)
+	passkeyLoginSessions.Delete(mfaToken)
 	h.respondWithAdminToken(c, admin)
+}
+
+func (h *AuthHandler) loadPendingMFAAdmin(c *gin.Context, token string) (models.Admin, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return models.Admin{}, security.ErrInvalidToken
+	}
+	claims, errParse := security.ParsePendingMFAToken(h.jwtCfg.Secret, token)
+	if errParse != nil {
+		return models.Admin{}, errParse
+	}
+
+	var admin models.Admin
+	if errFind := h.db.WithContext(c.Request.Context()).
+		Where("id = ?", claims.UserID).
+		First(&admin).Error; errFind != nil {
+		return models.Admin{}, security.ErrInvalidToken
+	}
+	if !constantTimeUsernameMatch(admin.Username, claims.Username) {
+		return models.Admin{}, security.ErrInvalidToken
+	}
+	return admin, nil
+}
+
+func respondPendingMFAError(c *gin.Context, err error) {
+	if errors.Is(err, security.ErrExpiredToken) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa token expired"})
+		return
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid mfa token"})
 }
 
 // respondWithAdminToken generates a JWT and responds with admin info.
