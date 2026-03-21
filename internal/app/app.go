@@ -24,6 +24,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelreference"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelregistry"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/quota"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/ratelimit"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/security"
 	internalsettings "github.com/router-for-me/CLIProxyAPIBusiness/internal/settings"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/store"
 	internalusage "github.com/router-for-me/CLIProxyAPIBusiness/internal/usage"
@@ -96,6 +98,10 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 	access.RegisterDBAPIKeyProvider(conn)
 
 	jwtConfig, _ := config.LoadJWTConfig(configPath)
+	corsOrigins, err := config.LoadCORSOrigins(configPath, cfg.CORSOrigins)
+	if err != nil {
+		return err
+	}
 
 	authStore := store.NewGormAuthStore(conn)
 	sdkAuth.RegisterTokenStore(authStore)
@@ -112,6 +118,7 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 	}
 
 	serverAccessMgr := sdkaccess.NewManager()
+	authRateLimiter := ratelimit.NewManager(ratelimit.LoadSettingsConfig, time.Now, nil)
 
 	coreManager := coreauth.NewManager(authStore, internalauth.NewSelector(conn), internalauth.NewStatusCodeHook())
 
@@ -131,7 +138,7 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 			sdkapi.WithMiddleware(
 				logging.GinLogrusRecovery(),
 				logging.GinLogrusLogger(),
-				corsMiddleware(),
+				corsMiddleware(corsOrigins...),
 				func(c *gin.Context) {
 					if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
 						return
@@ -149,8 +156,8 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 				relayhttp.CLIProxyModelsMiddleware(conn, modelStore),
 			),
 			sdkapi.WithRouterConfigurator(func(engine *gin.Engine, baseHandler *sdkhandlers.BaseAPIHandler, cfg *sdkconfig.Config) {
-				internalhttp.RegisterAdminRoutes(engine, conn, jwtConfig, configPath, cfg, baseHandler)
-				front.RegisterFrontRoutes(engine, conn, jwtConfig, modelStore)
+				internalhttp.RegisterAdminRoutes(engine, conn, jwtConfig, configPath, cfg, baseHandler, authRateLimiter)
+				front.RegisterFrontRoutes(engine, conn, jwtConfig, modelStore, authRateLimiter)
 				engine.StaticFS("/assets", webBundle.AssetsFS)
 				engine.GET("/v0/init/status", func(c *gin.Context) {
 					c.JSON(http.StatusOK, InitStatusResponse{Initialized: initState.Load()})
@@ -196,8 +203,8 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 						c.JSON(http.StatusBadRequest, gin.H{"error": "Admin password is required"})
 						return
 					}
-					if len(req.AdminPassword) < 6 {
-						c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 6 characters"})
+					if errPassword := security.ValidatePassword(req.AdminPassword); errPassword != nil {
+						c.JSON(http.StatusBadRequest, gin.H{"error": errPassword.Error()})
 						return
 					}
 

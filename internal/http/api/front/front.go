@@ -6,29 +6,32 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
+	relayhttp "github.com/router-for-me/CLIProxyAPIBusiness/internal/http"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/front/handlers"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelregistry"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/ratelimit"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/security"
 	"gorm.io/gorm"
 )
 
 // RegisterFrontRoutes registers public and authenticated front-end routes.
-func RegisterFrontRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, modelStore *modelregistry.Store) {
+func RegisterFrontRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, modelStore *modelregistry.Store, authRateLimiter *ratelimit.Manager) {
 	if r == nil || db == nil {
 		return
 	}
 
 	front := r.Group("/v0/front")
 
+	auth := front.Group("")
+	auth.Use(relayhttp.AuthRateLimitMiddleware(authRateLimiter))
 	authHandler := handlers.NewAuthHandler(db, jwtCfg)
-	front.POST("/register", authHandler.Register)
-	front.POST("/login", authHandler.Login)
-	front.POST("/login/prepare", authHandler.LoginPrepare)
-	front.POST("/login/totp", authHandler.LoginTOTP)
-	front.POST("/login/passkey/options", authHandler.LoginPasskeyOptions)
-	front.POST("/login/passkey/verify", authHandler.LoginPasskeyVerify)
-	front.POST("/reset-password", authHandler.ResetPassword)
+	auth.POST("/register", authHandler.Register)
+	auth.POST("/login", authHandler.Login)
+	auth.POST("/login/prepare", authHandler.LoginPrepare)
+	auth.POST("/login/totp", authHandler.LoginTOTP)
+	auth.POST("/login/passkey/options", authHandler.LoginPasskeyOptions)
+	auth.POST("/login/passkey/verify", authHandler.LoginPasskeyVerify)
 	front.GET("/config", handlers.GetPublicConfig)
 
 	authed := front.Group("")
@@ -37,6 +40,7 @@ func RegisterFrontRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, mo
 	profileHandler := handlers.NewProfileHandler(db)
 	authed.GET("/profile", profileHandler.Get)
 	authed.PUT("/profile/password", profileHandler.ChangePassword)
+	authed.POST("/reset-password", authHandler.ResetPassword)
 
 	webAuthn, errWebAuthn := security.NewWebAuthn()
 	if errWebAuthn != nil {

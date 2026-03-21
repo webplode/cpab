@@ -5,7 +5,8 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-cpab}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insecure-change-me}
+      # Required: set a strong database password in your shell or .env file before startup.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-cpab}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
@@ -24,9 +25,13 @@ services:
     container_name: "cpab"
     restart: unless-stopped
     environment:
-      # Construct connection string from individual variables
-      DB_CONNECTION: "postgres://${POSTGRES_USER:-cpab}:${POSTGRES_PASSWORD:-insecure-change-me}@postgres:5432/${POSTGRES_DB:-cpab}?sslmode=disable"
-      JWT_SECRET: ${JWT_SECRET:-insecure-jwt-secret-change-me}
+      # Required: set POSTGRES_PASSWORD before startup.
+      # This local compose file keeps sslmode=disable for a non-TLS Postgres container; change it to require for TLS-enabled deployments.
+      DB_CONNECTION: "postgres://${POSTGRES_USER:-cpab}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-cpab}?sslmode=disable"
+      # Optional comma-separated browser origins for admin/front API CORS, e.g. https://admin.example.com,https://portal.example.com
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Required: set JWT_SECRET to a strong random value. Generate one with: openssl rand -hex 32
+      JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRY: ${JWT_EXPIRY:-720h}
     depends_on:
       postgres:

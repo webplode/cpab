@@ -14,6 +14,8 @@ const (
 	AutoAssignProxyKey = "AUTO_ASSIGN_PROXY"
 	// RateLimitKey controls the default rate limit per second.
 	RateLimitKey = "RATE_LIMIT"
+	// AuthRateLimitKey controls the default auth-route rate limit per minute.
+	AuthRateLimitKey = "AUTH_RATE_LIMIT"
 	// RateLimitRedisEnabledKey toggles Redis-backed rate limiting.
 	RateLimitRedisEnabledKey = "RATE_LIMIT_REDIS_ENABLED"
 	// RateLimitRedisAddrKey defines the Redis address for rate limiting.
@@ -32,6 +34,8 @@ const (
 	DefaultAutoAssignProxy = false
 	// DefaultRateLimit is the fallback rate limit (0 means unlimited).
 	DefaultRateLimit = 0
+	// DefaultAuthRateLimit is the fallback auth-route limit per minute.
+	DefaultAuthRateLimit = 5
 	// DefaultRateLimitRedisPrefix is the fallback Redis key prefix.
 	DefaultRateLimitRedisPrefix = "cpab:rl"
 )

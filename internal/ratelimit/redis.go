@@ -36,13 +36,18 @@ func NewRedisLimiter(client *redis.Client, prefix string) *RedisLimiter {
 
 // Allow checks whether the request should be allowed in the current second.
 func (l *RedisLimiter) Allow(ctx context.Context, key string, limit int, now time.Time) (Result, error) {
+	return l.allowWindow(ctx, key, limit, now, time.Second)
+}
+
+func (l *RedisLimiter) allowWindow(ctx context.Context, key string, limit int, now time.Time, window time.Duration) (Result, error) {
 	if limit <= 0 || key == "" || l == nil || l.client == nil {
 		return Result{Allowed: true}, nil
 	}
-	sec := now.Unix()
-	reset := time.Unix(sec+1, 0).UTC()
-	redisKey := l.buildKey(key, sec)
-	res, errEval := redisIncrScript.Run(ctx, l.client, []string{redisKey}, redisWindowTTLSeconds).Result()
+	windowSeconds := normalizeWindowSeconds(window)
+	bucket := now.Unix() / windowSeconds
+	reset := time.Unix((bucket+1)*windowSeconds, 0).UTC()
+	redisKey := l.buildKey(key, bucket, windowSeconds)
+	res, errEval := redisIncrScript.Run(ctx, l.client, []string{redisKey}, windowSeconds+1).Result()
 	if errEval != nil {
 		return Result{}, errEval
 	}
@@ -67,11 +72,12 @@ func (l *RedisLimiter) Allow(ctx context.Context, key string, limit int, now tim
 	return Result{Allowed: true, Remaining: remaining, Reset: reset}, nil
 }
 
-func (l *RedisLimiter) buildKey(key string, sec int64) string {
-	secStr := strconv.FormatInt(sec, 10)
+func (l *RedisLimiter) buildKey(key string, bucket int64, windowSeconds int64) string {
+	bucketStr := strconv.FormatInt(bucket, 10)
+	windowStr := strconv.FormatInt(windowSeconds, 10)
 	prefix := strings.TrimSpace(l.prefix)
 	if prefix == "" {
-		return key + ":" + secStr
+		return key + ":" + windowStr + ":" + bucketStr
 	}
-	return prefix + ":" + key + ":" + secStr
+	return prefix + ":" + key + ":" + windowStr + ":" + bucketStr
 }

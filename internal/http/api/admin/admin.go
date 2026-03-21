@@ -9,15 +9,17 @@ import (
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
+	relayhttp "github.com/router-for-me/CLIProxyAPIBusiness/internal/http"
 	handlers "github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/admin/handlers"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/admin/permissions"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/ratelimit"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/security"
 	"gorm.io/gorm"
 )
 
 // RegisterAdminRoutes registers admin routes, middleware, and handlers.
-func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, configPath string, cfg *sdkconfig.Config, baseHandler *sdkhandlers.BaseAPIHandler) {
+func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, configPath string, cfg *sdkconfig.Config, baseHandler *sdkhandlers.BaseAPIHandler, authRateLimiter *ratelimit.Manager) {
 	if r == nil || db == nil {
 		return
 	}
@@ -25,7 +27,7 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	healthHandler := handlers.NewHealthHandler(db)
 	r.GET("/healthz", healthHandler.Healthz)
 
-	versionHandler := handlers.NewVersionHandler()
+	versionHandler := handlers.NewVersionHandler(db, jwtCfg)
 	r.GET("/v0/version", versionHandler.GetVersion)
 
 	adminGroup := r.Group("/v0/admin")
@@ -35,12 +37,14 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 		webAuthn = nil
 	}
 
+	authRoutes := adminGroup.Group("")
+	authRoutes.Use(relayhttp.AuthRateLimitMiddleware(authRateLimiter))
 	authHandler := handlers.NewAuthHandler(db, jwtCfg, webAuthn)
-	adminGroup.POST("/login", authHandler.Login)
-	adminGroup.POST("/login/prepare", authHandler.LoginPrepare)
-	adminGroup.POST("/login/totp", authHandler.LoginTOTP)
-	adminGroup.POST("/login/passkey/options", authHandler.LoginPasskeyOptions)
-	adminGroup.POST("/login/passkey/verify", authHandler.LoginPasskeyVerify)
+	authRoutes.POST("/login", authHandler.Login)
+	authRoutes.POST("/login/prepare", authHandler.LoginPrepare)
+	authRoutes.POST("/login/totp", authHandler.LoginTOTP)
+	authRoutes.POST("/login/passkey/options", authHandler.LoginPasskeyOptions)
+	authRoutes.POST("/login/passkey/verify", authHandler.LoginPasskeyVerify)
 
 	selfAuthed := adminGroup.Group("")
 	selfAuthed.Use(adminAuthMiddleware(db, jwtCfg))

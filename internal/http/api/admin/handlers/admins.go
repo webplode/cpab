@@ -51,6 +51,10 @@ func (h *AdminHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing password"})
 		return
 	}
+	if errValidate := security.ValidatePassword(password); errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+		return
+	}
 
 	hash, errHash := security.HashPassword(password)
 	if errHash != nil {
@@ -320,6 +324,10 @@ func (h *AdminHandler) ChangePassword(c *gin.Context) {
 	}
 	if password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing password"})
+		return
+	}
+	if errValidate := security.ValidatePassword(password); errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 		return
 	}
 	hash, errHash := security.HashPassword(password)

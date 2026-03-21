@@ -185,17 +185,24 @@ type tlsCfg struct {
 	Key    string `yaml:"key"`
 }
 
+var generateRandomString = security.GenerateRandomString
+
 // generateJWTSecret creates a random JWT secret string.
-func generateJWTSecret() string {
-	secret, err := security.GenerateRandomString(32)
+func generateJWTSecret() (string, error) {
+	secret, err := generateRandomString(32)
 	if err != nil {
-		return "change-me-to-a-secure-random-string"
+		return "", fmt.Errorf("generate jwt secret: %w", err)
 	}
-	return secret
+	return secret, nil
 }
 
 // WriteConfigFile writes the initial config file to disk.
 func WriteConfigFile(configPath string, dsn string, port int) error {
+	jwtSecret, err := generateJWTSecret()
+	if err != nil {
+		return err
+	}
+
 	cfg := configFile{
 		Host:           "",
 		Port:           port,
@@ -204,7 +211,7 @@ func WriteConfigFile(configPath string, dsn string, port int) error {
 		CommercialMode: false,
 		LoggingToFile:  false,
 		JWT: jwtCfg{
-			Secret: generateJWTSecret(),
+			Secret: jwtSecret,
 			Expiry: "720h",
 		},
 		TLS: tlsCfg{
@@ -246,6 +253,9 @@ func CreateAdminUser(dsn string, username, password, siteName string) error {
 func CreateAdminUserWithConn(conn *gorm.DB, username, password, siteName string) error {
 	if conn == nil {
 		return fmt.Errorf("open database: nil connection")
+	}
+	if errValidate := security.ValidatePassword(password); errValidate != nil {
+		return errValidate
 	}
 
 	hashedPassword, errHash := security.HashPassword(password)
@@ -316,9 +326,14 @@ var ErrInitCompleted = fmt.Errorf("init completed")
 // RunInitServer starts the initialization server when config is missing.
 func RunInitServer(ctx context.Context, cfg config.AppConfig, port int) error {
 	gin.SetMode(gin.ReleaseMode)
+	configPath := config.ResolveConfigPath(cfg.ConfigPath)
+	corsOrigins, err := config.LoadCORSOrigins(configPath, cfg.CORSOrigins)
+	if err != nil {
+		return err
+	}
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	engine.Use(corsMiddleware())
+	engine.Use(corsMiddleware(corsOrigins...))
 
 	webBundle, errLoad := webui.Load()
 	if errLoad != nil {
@@ -326,8 +341,6 @@ func RunInitServer(ctx context.Context, cfg config.AppConfig, port int) error {
 	}
 
 	engine.StaticFS("/assets", webBundle.AssetsFS)
-
-	configPath := config.ResolveConfigPath(cfg.ConfigPath)
 
 	initDone := make(chan struct{})
 
@@ -352,8 +365,8 @@ func RunInitServer(ctx context.Context, cfg config.AppConfig, port int) error {
 			return
 		}
 
-		if len(req.AdminPassword) < 6 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 6 characters"})
+		if errPassword := security.ValidatePassword(req.AdminPassword); errPassword != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errPassword.Error()})
 			return
 		}
 

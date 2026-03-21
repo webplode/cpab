@@ -13,6 +13,7 @@ import (
 // SettingsConfig captures rate limit settings stored in DB config.
 type SettingsConfig struct {
 	Limit         int
+	AuthLimit     int
 	RedisEnabled  bool
 	RedisAddr     string
 	RedisPassword string
@@ -24,12 +25,18 @@ type SettingsConfig struct {
 func LoadSettingsConfig() SettingsConfig {
 	cfg := SettingsConfig{
 		Limit:       internalsettings.DefaultRateLimit,
+		AuthLimit:   internalsettings.DefaultAuthRateLimit,
 		RedisPrefix: internalsettings.DefaultRateLimitRedisPrefix,
 	}
 
 	if raw, ok := internalsettings.DBConfigValue(internalsettings.RateLimitKey); ok {
 		if limit, okParse := parseNonNegativeInt(raw); okParse {
 			cfg.Limit = limit
+		}
+	}
+	if raw, ok := internalsettings.DBConfigValue(internalsettings.AuthRateLimitKey); ok {
+		if limit, okParse := parseNonNegativeInt(raw); okParse {
+			cfg.AuthLimit = limit
 		}
 	}
 	if raw, ok := internalsettings.DBConfigValue(internalsettings.RateLimitRedisEnabledKey); ok {
@@ -69,6 +76,9 @@ func LoadSettingsConfig() SettingsConfig {
 	if cfg.Limit < 0 {
 		cfg.Limit = 0
 	}
+	if cfg.AuthLimit < 0 {
+		cfg.AuthLimit = 0
+	}
 	return cfg
 }
 
@@ -79,6 +89,15 @@ func DefaultSettingsLimit() int {
 		return 0
 	}
 	return cfg.Limit
+}
+
+// DefaultAuthSettingsLimit returns the default auth rate limit configured in settings.
+func DefaultAuthSettingsLimit() int {
+	cfg := LoadSettingsConfig()
+	if cfg.AuthLimit < 0 {
+		return 0
+	}
+	return cfg.AuthLimit
 }
 
 func parseBool(raw json.RawMessage) (bool, bool) {

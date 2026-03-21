@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 )
 
 const redisBreakerDuration = 30 * time.Second
+const authRateLimitWindow = time.Minute
 
 // SettingsProvider supplies the latest settings snapshot.
 type SettingsProvider func() SettingsConfig
@@ -30,7 +32,7 @@ type redisConfig struct {
 type Manager struct {
 	provider       SettingsProvider
 	nowFn          func() time.Time
-	memoryLimiter  Limiter
+	memoryLimiter  *MemoryLimiter
 	newRedisClient RedisClientFactory
 	mu             sync.Mutex
 	redisLimiter   *RedisLimiter
@@ -59,24 +61,40 @@ func NewManager(provider SettingsProvider, nowFn func() time.Time, newRedisClien
 
 // Allow checks whether the request should be allowed using the best available backend.
 func (m *Manager) Allow(ctx context.Context, key string, limit int) (Result, error) {
+	return m.AllowWindow(ctx, key, limit, time.Second)
+}
+
+// AllowAuth checks the auth-route limiter using the configured auth limit.
+func (m *Manager) AllowAuth(ctx context.Context, key string) (Result, error) {
+	if m == nil {
+		return Result{Allowed: true}, nil
+	}
+	cfg := m.provider()
+	return m.AllowWindow(ctx, key, cfg.AuthLimit, authRateLimitWindow)
+}
+
+// AllowWindow checks whether the request should be allowed for a custom fixed window.
+func (m *Manager) AllowWindow(ctx context.Context, key string, limit int, window time.Duration) (Result, error) {
 	if limit <= 0 || key == "" {
 		return Result{Allowed: true}, nil
 	}
 	if m == nil {
 		return Result{Allowed: true}, nil
 	}
+	windowSeconds := normalizeWindowSeconds(window)
+	scopedKey := keyForWindow(key, windowSeconds)
 	now := m.nowFn()
 	cfg := m.provider()
 
 	if cfg.RedisEnabled {
-		if result, ok := m.allowRedis(ctx, key, limit, now, cfg); ok {
+		if result, ok := m.allowRedis(ctx, scopedKey, limit, now, cfg, windowSeconds); ok {
 			return result, nil
 		}
 	}
-	return m.memoryLimiter.Allow(ctx, key, limit, now)
+	return m.memoryLimiter.allowWindow(scopedKey, limit, now, time.Duration(windowSeconds)*time.Second)
 }
 
-func (m *Manager) allowRedis(ctx context.Context, key string, limit int, now time.Time, cfg SettingsConfig) (Result, bool) {
+func (m *Manager) allowRedis(ctx context.Context, key string, limit int, now time.Time, cfg SettingsConfig, windowSeconds int64) (Result, bool) {
 	if m == nil {
 		return Result{}, false
 	}
@@ -94,7 +112,7 @@ func (m *Manager) allowRedis(ctx context.Context, key string, limit int, now tim
 	if limiter == nil {
 		return Result{}, false
 	}
-	result, errAllow := limiter.Allow(ctx, key, limit, now)
+	result, errAllow := limiter.allowWindow(ctx, key, limit, now, time.Duration(windowSeconds)*time.Second)
 	if errAllow != nil {
 		m.tripBreaker(errAllow, now)
 		return Result{}, false
@@ -172,4 +190,26 @@ func (m *Manager) ensureRedis(ctx context.Context, cfg SettingsConfig, now time.
 	m.redisLimiter = NewRedisLimiter(client, nextCfg.prefix)
 	m.redisCfg = nextCfg
 	return m.redisLimiter, nil
+}
+
+func normalizeWindowSeconds(window time.Duration) int64 {
+	if window <= 0 {
+		return 1
+	}
+	windowSeconds := int64(window / time.Second)
+	if window%time.Second != 0 {
+		windowSeconds++
+	}
+	if windowSeconds <= 0 {
+		return 1
+	}
+	return windowSeconds
+}
+
+func keyForWindow(key string, windowSeconds int64) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	return key + ":w:" + strconv.FormatInt(windowSeconds, 10)
 }

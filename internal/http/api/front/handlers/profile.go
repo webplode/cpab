@@ -76,6 +76,10 @@ func (h *ProfileHandler) ChangePassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing password"})
 		return
 	}
+	if errValidate := security.ValidatePassword(newPassword); errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+		return
+	}
 
 	var user models.User
 	if errFind := h.db.WithContext(c.Request.Context()).First(&user, userID).Error; errFind != nil {

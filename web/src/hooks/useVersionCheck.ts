@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react';
-import { API_BASE_URL } from '../api/config';
+import { apiFetchAdmin } from '../api/config';
 
 interface VersionInfo {
     currentVersion: string;
@@ -21,6 +21,16 @@ interface CachedVersionData {
     data: VersionInfo;
     timestamp: number;
     cachedCurrentVersion: string;
+}
+
+interface VersionAPIResponse {
+    current_version?: string;
+    latest_version?: string;
+    has_update?: boolean;
+    release_url?: string;
+    commit?: string;
+    build_date?: string;
+    check_error?: string;
 }
 
 const CACHE_KEY = 'version_check_cache';
@@ -58,9 +68,7 @@ function isCacheValid(cached: CachedVersionData): boolean {
 
 async function fetchCurrentVersion(): Promise<string | null> {
     try {
-        const response = await fetch(`${API_BASE_URL}/v0/version`);
-        if (!response.ok) return null;
-        const json = await response.json();
+        const json = await apiFetchAdmin<VersionAPIResponse>('/v0/version');
         return json.current_version || null;
     } catch {
         return null;
@@ -68,15 +76,11 @@ async function fetchCurrentVersion(): Promise<string | null> {
 }
 
 async function fetchVersionInfo(): Promise<VersionInfo> {
-    const response = await fetch(`${API_BASE_URL}/v0/version`);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-    const json = await response.json();
+    const json = await apiFetchAdmin<VersionAPIResponse>('/v0/version');
     return {
-        currentVersion: json.current_version,
+        currentVersion: json.current_version || '',
         latestVersion: json.latest_version || '',
-        hasUpdate: json.has_update,
+        hasUpdate: json.has_update || false,
         releaseUrl: json.release_url || '',
         commit: json.commit || '',
         buildDate: json.build_date || '',

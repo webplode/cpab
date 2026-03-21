@@ -11,6 +11,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/security"
+	"gorm.io/gorm"
 )
 
 const (
@@ -65,11 +69,14 @@ func (c *versionCache) setError() {
 }
 
 // VersionHandler handles version check endpoints.
-type VersionHandler struct{}
+type VersionHandler struct {
+	db     *gorm.DB
+	jwtCfg config.JWTConfig
+}
 
 // NewVersionHandler constructs a VersionHandler.
-func NewVersionHandler() *VersionHandler {
-	return &VersionHandler{}
+func NewVersionHandler(db *gorm.DB, jwtCfg config.JWTConfig) *VersionHandler {
+	return &VersionHandler{db: db, jwtCfg: jwtCfg}
 }
 
 // VersionResponse is the response for version check.
@@ -83,8 +90,17 @@ type VersionResponse struct {
 	CheckError     string `json:"check_error,omitempty"`
 }
 
+type publicVersionResponse struct {
+	Status string `json:"status"`
+}
+
 // GetVersion returns current version and checks for updates from GitHub.
 func (h *VersionHandler) GetVersion(c *gin.Context) {
+	if !h.isAuthenticatedAdmin(c) {
+		c.JSON(http.StatusOK, publicVersionResponse{Status: "ok"})
+		return
+	}
+
 	resp := VersionResponse{
 		CurrentVersion: buildinfo.Version,
 		Commit:         buildinfo.Commit,
@@ -114,6 +130,36 @@ func (h *VersionHandler) GetVersion(c *gin.Context) {
 	resp.HasUpdate = isNewerVersion(buildinfo.Version, latestVersion)
 
 	c.JSON(http.StatusOK, resp)
+}
+
+func (h *VersionHandler) isAuthenticatedAdmin(c *gin.Context) bool {
+	if h == nil || h.db == nil {
+		return false
+	}
+
+	authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+	if authHeader == "" {
+		return false
+	}
+
+	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	if token == "" || token == authHeader {
+		return false
+	}
+
+	claims, errParse := security.ParseAdminToken(h.jwtCfg.Secret, token)
+	if errParse != nil {
+		return false
+	}
+
+	var admin models.Admin
+	if errFind := h.db.WithContext(c.Request.Context()).
+		Select("id", "username", "active").
+		First(&admin, claims.AdminID).Error; errFind != nil {
+		return false
+	}
+
+	return admin.Active && admin.Username == claims.Username
 }
 
 func fetchLatestRelease(ctx context.Context) (version string, url string, err error) {
