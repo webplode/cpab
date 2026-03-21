@@ -138,7 +138,6 @@ func (h *APIKeyHandler) ListByUser(c *gin.Context) {
 		out = append(out, gin.H{
 			"id":           row.ID,
 			"name":         row.Name,
-			"key":          row.APIKey,
 			"key_prefix":   prefix,
 			"active":       row.Active,
 			"expires_at":   row.ExpiresAt,

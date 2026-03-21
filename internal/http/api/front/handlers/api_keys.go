@@ -18,6 +18,8 @@ type APIKeyHandler struct {
 	db *gorm.DB
 }
 
+const apiKeyRevealWarning = "This is the only time the full key will be shown"
+
 // NewAPIKeyHandler constructs an APIKeyHandler.
 func NewAPIKeyHandler(db *gorm.DB) *APIKeyHandler {
 	return &APIKeyHandler{db: db}
@@ -104,7 +106,6 @@ func (h *APIKeyHandler) serializeAPIKey(row *models.APIKey) gin.H {
 	return gin.H{
 		"id":           row.ID,
 		"name":         row.Name,
-		"key":          row.APIKey,
 		"key_prefix":   prefix,
 		"active":       row.Active,
 		"status":       row.Status(),
@@ -245,9 +246,10 @@ func (h *APIKeyHandler) Create(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
-		"id":    row.ID,
-		"name":  row.Name,
-		"token": token,
+		"id":      row.ID,
+		"name":    row.Name,
+		"token":   token,
+		"warning": apiKeyRevealWarning,
 	})
 }
 
@@ -319,7 +321,7 @@ func (h *APIKeyHandler) Revoke(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
-	res := h.db.Debug().WithContext(c.Request.Context()).Model(&models.APIKey{}).
+	res := h.db.WithContext(c.Request.Context()).Model(&models.APIKey{}).
 		Where("id = ? AND user_id = ? AND revoked_at IS NULL", id, userID).
 		Updates(map[string]any{
 			"active":     false,
@@ -449,6 +451,7 @@ func (h *APIKeyHandler) Regenerate(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"token": token,
+		"token":   token,
+		"warning": apiKeyRevealWarning,
 	})
 }

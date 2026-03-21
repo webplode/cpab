@@ -78,10 +78,11 @@ func (p *DBAPIKeyProvider) Authenticate(ctx context.Context, r *http.Request) (*
 		return nil, sdkaccess.NewNoCredentialsError()
 	}
 
+	now := time.Now().UTC()
 	var apiKey models.APIKey
 	err := p.db.WithContext(ctx).
 		Preload("User").
-		Where("api_key = ? AND active = ? AND revoked_at IS NULL", token, true).
+		Where("api_key = ? AND active = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", token, true, now).
 		First(&apiKey).Error
 	switch {
 	case err == nil:
@@ -106,7 +107,6 @@ func (p *DBAPIKeyProvider) Authenticate(ctx context.Context, r *http.Request) (*
 		}
 	}
 
-	now := time.Now().UTC()
 	_ = p.db.WithContext(ctx).Model(&models.APIKey{}).
 		Where("id = ?", apiKey.ID).
 		Update("last_used_at", &now).Error
