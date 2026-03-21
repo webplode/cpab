@@ -8,6 +8,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,7 @@ const (
 	maxConcurrentRequests = 5
 	noAuthRetryInterval   = 10 * time.Second
 	maxErrorBodyBytes     = 512
+	tokenInvalidatedCode  = "token_invalidated"
 )
 
 const (
@@ -256,6 +259,10 @@ func (p *Poller) pollAntigravity(ctx context.Context, auth *coreauth.Auth, row a
 			continue
 		}
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			if isTokenInvalidatedResponse(status, payload) {
+				p.evictInvalidatedAuth(ctx, auth, row, "antigravity")
+				return
+			}
 			log.Warnf("quota poller: antigravity status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
 			continue
 		}
@@ -285,6 +292,10 @@ func (p *Poller) pollCodex(ctx context.Context, auth *coreauth.Auth, row authRow
 		return
 	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		if isTokenInvalidatedResponse(status, payload) {
+			p.evictInvalidatedAuth(ctx, auth, row, "codex")
+			return
+		}
 		log.Warnf("quota poller: codex status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
 		return
 	}
@@ -315,6 +326,10 @@ func (p *Poller) pollGeminiCLI(ctx context.Context, auth *coreauth.Auth, row aut
 		return
 	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		if isTokenInvalidatedResponse(status, payload) {
+			p.evictInvalidatedAuth(ctx, auth, row, "gemini-cli")
+			return
+		}
 		log.Warnf("quota poller: gemini-cli status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
 		return
 	}
@@ -399,6 +414,170 @@ func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, 
 		return p.db.WithContext(ctx).Create(&row).Error
 	}
 	return errFind
+}
+
+func (p *Poller) evictInvalidatedAuth(ctx context.Context, auth *coreauth.Auth, row authRowInfo, provider string) {
+	if p == nil || p.db == nil || p.manager == nil || auth == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+
+	p.disableRuntimeAuth(ctx, authID)
+	if errDelete := p.deleteAuthAndQuota(ctx, row, authID); errDelete != nil {
+		log.WithError(errDelete).Warnf("quota poller: failed to delete invalidated auth record (auth=%s provider=%s)", authID, provider)
+		return
+	}
+
+	removedFiles, errRemoveFiles := removeAuthFilesFromDisk(authID, auth)
+	if errRemoveFiles != nil {
+		log.WithError(errRemoveFiles).Warnf("quota poller: failed removing invalidated auth files (auth=%s provider=%s)", authID, provider)
+	}
+
+	if errLoad := p.manager.Load(coreauth.WithSkipPersist(ctx)); errLoad != nil {
+		log.WithError(errLoad).Warnf("quota poller: failed to refresh auth manager after eviction (auth=%s provider=%s)", authID, provider)
+	}
+
+	log.Warnf("quota poller: evicted invalidated auth (provider=%s auth=%s db_id=%d files_removed=%d)", provider, authID, row.ID, removedFiles)
+}
+
+func (p *Poller) disableRuntimeAuth(ctx context.Context, authID string) {
+	if p == nil || p.manager == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+
+	existing, ok := p.manager.GetByID(authID)
+	if !ok || existing == nil {
+		return
+	}
+
+	next := existing.Clone()
+	next.Disabled = true
+	next.Status = coreauth.StatusDisabled
+	next.UpdatedAt = time.Now().UTC()
+	if _, errUpdate := p.manager.Update(coreauth.WithSkipPersist(ctx), next); errUpdate != nil {
+		log.WithError(errUpdate).Warnf("quota poller: failed to disable invalidated auth in runtime manager (auth=%s)", authID)
+	}
+}
+
+func (p *Poller) deleteAuthAndQuota(ctx context.Context, row authRowInfo, authID string) error {
+	if p == nil || p.db == nil {
+		return errors.New("quota poller: db not initialized")
+	}
+	authID = strings.TrimSpace(authID)
+	if row.ID == 0 && authID == "" {
+		return errors.New("quota poller: missing auth identifier")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	return p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx.Model(&models.Auth{})
+		if row.ID != 0 {
+			query = query.Where("id = ?", row.ID)
+		} else {
+			query = query.Where("key = ?", authID)
+		}
+		if errDelete := query.Delete(&models.Auth{}).Error; errDelete != nil {
+			return errDelete
+		}
+
+		if row.ID != 0 {
+			if errDeleteQuota := tx.Where("auth_id = ?", row.ID).Delete(&models.Quota{}).Error; errDeleteQuota != nil {
+				return errDeleteQuota
+			}
+		}
+		return nil
+	})
+}
+
+func removeAuthFilesFromDisk(authID string, auth *coreauth.Auth) (int, error) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0, nil
+	}
+
+	workingDir, errGetwd := os.Getwd()
+	if errGetwd != nil {
+		return 0, errGetwd
+	}
+	baseDir := filepath.Clean(workingDir)
+	if baseDir == "" {
+		return 0, nil
+	}
+
+	candidates := make([]string, 0, 3)
+	if auth != nil {
+		candidates = append(candidates, strings.TrimSpace(auth.Attributes["path"]))
+		candidates = append(candidates, strings.TrimSpace(auth.Attributes["source"]))
+	}
+	if derived := safeJoinAuthPath(baseDir, authID); derived != "" {
+		candidates = append(candidates, derived)
+	}
+
+	removed := 0
+	seen := make(map[string]struct{}, len(candidates))
+	var firstErr error
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(strings.TrimSpace(candidate))
+		if candidate == "" || !filepath.IsAbs(candidate) {
+			continue
+		}
+		if candidate != baseDir && !strings.HasPrefix(candidate, baseDir+string(os.PathSeparator)) {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+
+		if errRemove := os.Remove(candidate); errRemove != nil {
+			if errors.Is(errRemove, os.ErrNotExist) {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = errRemove
+			}
+			continue
+		}
+		removed++
+	}
+	return removed, firstErr
+}
+
+func isTokenInvalidatedResponse(status int, payload []byte) bool {
+	if status != http.StatusUnauthorized {
+		return false
+	}
+	trimmed := bytesTrimSpace(payload)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return false
+	}
+
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+		Status int `json:"status"`
+	}
+	if errUnmarshal := json.Unmarshal(trimmed, &response); errUnmarshal != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(response.Error.Code), tokenInvalidatedCode) {
+		return false
+	}
+	return response.Status == 0 || response.Status == http.StatusUnauthorized
 }
 
 func normalizePayload(payload []byte) []byte {
@@ -515,6 +694,27 @@ func parseIDTokenPayload(value any) map[string]any {
 		return nil
 	}
 	return parsed
+}
+
+func safeJoinAuthPath(baseDir string, name string) string {
+	baseDir = strings.TrimSpace(baseDir)
+	name = strings.TrimSpace(name)
+	if baseDir == "" || name == "" {
+		return ""
+	}
+	if filepath.IsAbs(name) {
+		return ""
+	}
+	cleaned := filepath.Clean(name)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+		return ""
+	}
+	full := filepath.Clean(filepath.Join(baseDir, cleaned))
+	base := filepath.Clean(baseDir)
+	if full != base && !strings.HasPrefix(full, base+string(os.PathSeparator)) {
+		return ""
+	}
+	return full
 }
 
 func decodeBase64URL(value string) (string, error) {
