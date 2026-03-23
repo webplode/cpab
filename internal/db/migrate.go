@@ -612,6 +612,24 @@ func migratePostgres(conn *gorm.DB) error {
 				ON user_model_auth_bindings (user_id, model_mapping_id)
 			`,
 		},
+		{
+			name: "dedup_billing_rules_before_unique",
+			sql: `
+				DELETE FROM billing_rules
+				WHERE id NOT IN (
+					SELECT MIN(id)
+					FROM billing_rules
+					GROUP BY auth_group_id, user_group_id, provider, model
+				)
+			`,
+		},
+		{
+			name: "uq_billing_rules_group_provider_model",
+			sql: `
+				CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_rules_group_provider_model
+				ON billing_rules (auth_group_id, user_group_id, provider, model)
+			`,
+		},
 	}
 	for _, item := range ddls {
 		if errDDL := conn.Exec(item.sql).Error; errDDL != nil {
@@ -1170,6 +1188,24 @@ func migrateSQLite(conn *gorm.DB) error {
 			sql: `
 				CREATE UNIQUE INDEX IF NOT EXISTS idx_user_model_auth_bindings_user_model
 				ON user_model_auth_bindings (user_id, model_mapping_id)
+			`,
+		},
+		{
+			name: "dedup_billing_rules_before_unique",
+			sql: `
+				DELETE FROM billing_rules
+				WHERE id NOT IN (
+					SELECT MIN(id)
+					FROM billing_rules
+					GROUP BY auth_group_id, user_group_id, provider, model
+				)
+			`,
+		},
+		{
+			name: "uq_billing_rules_group_provider_model",
+			sql: `
+				CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_rules_group_provider_model
+				ON billing_rules (auth_group_id, user_group_id, provider, model)
 			`,
 		},
 	}

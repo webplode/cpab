@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -465,18 +466,26 @@ func (h *BillingRuleHandler) BatchImport(c *gin.Context) {
 		refByModelName[modelRefs[i].ModelName] = &modelRefs[i]
 	}
 
+	// Deduplicate mappings by (provider, new_model_name) so a model that
+	// appears under several underlying names produces only one billing rule.
+	type providerModel struct{ provider, model string }
+	seen := make(map[providerModel]bool, len(mappings))
+	unique := make([]models.ModelMapping, 0, len(mappings))
+	for _, m := range mappings {
+		key := providerModel{m.Provider, m.NewModelName}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, m)
+	}
+
 	now := time.Now().UTC()
 	var created, updated int
 
-	for _, mapping := range mappings {
+	for _, mapping := range unique {
 		provider := mapping.Provider
 		model := mapping.NewModelName
-
-		var existing models.BillingRule
-		errExist := h.db.WithContext(ctx).
-			Where("auth_group_id = ? AND user_group_id = ? AND provider = ? AND model = ?",
-				body.AuthGroupID, body.UserGroupID, provider, model).
-			First(&existing).Error
 
 		var pricePerRequest *float64
 		var priceInputToken, priceOutputToken, priceCacheCreate, priceCacheRead *float64
@@ -510,39 +519,38 @@ func (h *BillingRuleHandler) BatchImport(c *gin.Context) {
 			pricePerRequest = &zero
 		}
 
-		if errExist == nil {
-			updates := map[string]any{
-				"billing_type":             billingType,
-				"price_per_request":        pricePerRequest,
-				"price_input_token":        priceInputToken,
-				"price_output_token":       priceOutputToken,
-				"price_cache_create_token": priceCacheCreate,
-				"price_cache_read_token":   priceCacheRead,
-				"is_enabled":               true,
-				"updated_at":               now,
-			}
-			if errUpd := h.db.WithContext(ctx).Model(&models.BillingRule{}).Where("id = ?", existing.ID).Updates(updates).Error; errUpd == nil {
-				updated++
-			}
-		} else if errors.Is(errExist, gorm.ErrRecordNotFound) {
-			rule := models.BillingRule{
-				AuthGroupID:           body.AuthGroupID,
-				UserGroupID:           body.UserGroupID,
-				Provider:              provider,
-				Model:                 model,
-				BillingType:           billingType,
-				PricePerRequest:       pricePerRequest,
-				PriceInputToken:       priceInputToken,
-				PriceOutputToken:      priceOutputToken,
-				PriceCacheCreateToken: priceCacheCreate,
-				PriceCacheReadToken:   priceCacheRead,
-				IsEnabled:             true,
-				CreatedAt:             now,
-				UpdatedAt:             now,
-			}
-			if errCreate := h.db.WithContext(ctx).Create(&rule).Error; errCreate == nil {
-				created++
-			}
+		// Upsert: insert or update on the unique (auth_group_id, user_group_id, provider, model) constraint.
+		upsertSQL := `
+			INSERT INTO billing_rules
+				(auth_group_id, user_group_id, provider, model, billing_type,
+				 price_per_request, price_input_token, price_output_token,
+				 price_cache_create_token, price_cache_read_token,
+				 is_enabled, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, ?, ?)
+			ON CONFLICT (auth_group_id, user_group_id, provider, model) DO UPDATE SET
+				billing_type             = EXCLUDED.billing_type,
+				price_per_request        = EXCLUDED.price_per_request,
+				price_input_token        = EXCLUDED.price_input_token,
+				price_output_token       = EXCLUDED.price_output_token,
+				price_cache_create_token = EXCLUDED.price_cache_create_token,
+				price_cache_read_token   = EXCLUDED.price_cache_read_token,
+				is_enabled               = true,
+				updated_at               = EXCLUDED.updated_at
+			RETURNING (xmax = 0) AS inserted`
+		var inserted bool
+		if err := h.db.WithContext(ctx).Raw(upsertSQL,
+			body.AuthGroupID, body.UserGroupID, provider, model, billingType,
+			pricePerRequest, priceInputToken, priceOutputToken,
+			priceCacheCreate, priceCacheRead,
+			now, now,
+		).Scan(&inserted).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("upsert billing rule %s/%s: %v", provider, model, err)})
+			return
+		}
+		if inserted {
+			created++
+		} else {
+			updated++
 		}
 	}
 
