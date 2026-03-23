@@ -136,6 +136,25 @@ const NON_NEGATIVE_INTEGER_KEYS = new Set<string>([
     'RATE_LIMIT_REDIS_DB',
 ]);
 
+const DEFAULT_PROVIDER_ALLOWLIST = 'openai,anthropic,google';
+const DEFAULT_ONLY_CONFIGURED = true;
+
+const KNOWN_PROVIDERS: { token: string; name: string; description: string }[] = [
+    { token: 'openai', name: 'OpenAI', description: 'GPT, Codex, o-series' },
+    { token: 'anthropic', name: 'Anthropic', description: 'Claude' },
+    { token: 'google', name: 'Google', description: 'Gemini' },
+    { token: 'amazon', name: 'Amazon', description: 'Bedrock' },
+    { token: 'vertex', name: 'Vertex AI', description: 'Google Cloud' },
+    { token: 'mistral', name: 'Mistral', description: 'Mistral' },
+    { token: 'cohere', name: 'Cohere', description: 'Command, Embed' },
+    { token: 'deepseek', name: 'DeepSeek', description: 'DeepSeek' },
+    { token: 'xai', name: 'xAI', description: 'Grok' },
+    { token: 'together', name: 'Together AI', description: 'Open models' },
+    { token: 'groq', name: 'Groq', description: 'Fast inference' },
+    { token: 'fireworks', name: 'Fireworks', description: 'Fireworks AI' },
+    { token: 'perplexity', name: 'Perplexity', description: 'Perplexity' },
+];
+
 const inputClassName =
     'w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent';
 const listInputClassName = inputClassName.replace('w-full', 'flex-1');
@@ -220,6 +239,196 @@ function buildPayload(def: SettingDefinition, state: EditFormState): unknown {
 
 function buildOriginListPayload(entries: string[]): string[] {
     return entries.map((entry) => entry.trim()).filter(Boolean);
+}
+
+function ModelSyncSection({
+    settingsMap,
+    setSettingsMap,
+    canUpdate,
+    canCreate,
+    loading: parentLoading,
+    t,
+}: {
+    settingsMap: Record<string, unknown>;
+    setSettingsMap: React.Dispatch<React.SetStateAction<Record<string, unknown>>>;
+    canUpdate: boolean;
+    canCreate: boolean;
+    loading: boolean;
+    t: Translate;
+}) {
+    const canEdit = canUpdate || canCreate;
+    const [saving, setSaving] = useState(false);
+
+    const allowlistRaw = settingsMap['MODEL_REFERENCE_SYNC_PROVIDER_ALLOWLIST'];
+    const enabledTokens = useMemo(() => {
+        const raw = typeof allowlistRaw === 'string' ? allowlistRaw : DEFAULT_PROVIDER_ALLOWLIST;
+        if (!raw.trim()) return new Set<string>();
+        return new Set(
+            raw
+                .split(/[,;\n\r]+/)
+                .map((s) => s.trim().toLowerCase())
+                .filter(Boolean)
+        );
+    }, [allowlistRaw]);
+
+    const onlyConfiguredRaw = settingsMap['MODEL_REFERENCE_SYNC_ONLY_CONFIGURED_PROVIDERS'];
+    const onlyConfigured =
+        onlyConfiguredRaw === undefined ? DEFAULT_ONLY_CONFIGURED : Boolean(onlyConfiguredRaw);
+
+    const saveSetting = async (key: string, value: unknown) => {
+        const prev = settingsMap[key];
+        setSettingsMap((m) => ({ ...m, [key]: value }));
+        setSaving(true);
+        try {
+            if (canUpdate) {
+                try {
+                    await apiFetchAdmin(`/v0/admin/settings/${key}`, {
+                        method: 'PUT',
+                        body: JSON.stringify({ value }),
+                    });
+                    return;
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    if (!msg.toLowerCase().includes('not found') && !msg.includes('404')) {
+                        throw err;
+                    }
+                }
+            }
+            if (canCreate) {
+                await apiFetchAdmin('/v0/admin/settings', {
+                    method: 'POST',
+                    body: JSON.stringify({ key, value }),
+                });
+            }
+        } catch (err) {
+            console.error(err);
+            setSettingsMap((m) => ({ ...m, [key]: prev }));
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const toggleProvider = (token: string) => {
+        if (!canEdit || saving) return;
+        const next = new Set(enabledTokens);
+        if (next.has(token)) {
+            next.delete(token);
+        } else {
+            next.add(token);
+        }
+        saveSetting(
+            'MODEL_REFERENCE_SYNC_PROVIDER_ALLOWLIST',
+            Array.from(next).join(',')
+        );
+    };
+
+    const toggleOnlyConfigured = () => {
+        if (!canEdit || saving) return;
+        saveSetting('MODEL_REFERENCE_SYNC_ONLY_CONFIGURED_PROVIDERS', !onlyConfigured);
+    };
+
+    return (
+        <div className="bg-white dark:bg-surface-dark rounded-xl border border-gray-200 dark:border-border-dark shadow-sm overflow-hidden mb-6">
+            <div className="px-6 py-4 border-b border-gray-200 dark:border-border-dark">
+                <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                    {t('Model Reference Sync')}
+                </h3>
+                <p className="text-sm text-slate-500 dark:text-text-secondary mt-1">
+                    {t(
+                        'Select which providers to sync model information from. Only selected providers will have their models pulled from models.dev.'
+                    )}
+                </p>
+            </div>
+            <div className="px-6 py-4">
+                {parentLoading ? (
+                    <p className="text-sm text-slate-500 dark:text-text-secondary">
+                        {t('Loading...')}
+                    </p>
+                ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                        {KNOWN_PROVIDERS.map((provider) => {
+                            const enabled = enabledTokens.has(provider.token);
+                            return (
+                                <button
+                                    key={provider.token}
+                                    type="button"
+                                    onClick={() => toggleProvider(provider.token)}
+                                    disabled={!canEdit || saving}
+                                    className={`flex items-center gap-3 p-3 rounded-lg border text-left transition-colors disabled:opacity-50 ${
+                                        enabled
+                                            ? 'border-primary bg-primary/5 dark:bg-primary/10'
+                                            : 'border-gray-200 dark:border-border-dark hover:bg-slate-50 dark:hover:bg-background-dark'
+                                    }`}
+                                >
+                                    <div
+                                        className={`flex-shrink-0 w-5 h-5 rounded flex items-center justify-center transition-colors ${
+                                            enabled
+                                                ? 'bg-primary text-white'
+                                                : 'border-2 border-gray-300 dark:border-gray-500'
+                                        }`}
+                                    >
+                                        {enabled && (
+                                            <svg
+                                                className="w-3 h-3"
+                                                fill="none"
+                                                viewBox="0 0 24 24"
+                                                stroke="currentColor"
+                                                strokeWidth={3}
+                                            >
+                                                <path
+                                                    strokeLinecap="round"
+                                                    strokeLinejoin="round"
+                                                    d="M5 13l4 4L19 7"
+                                                />
+                                            </svg>
+                                        )}
+                                    </div>
+                                    <div className="min-w-0">
+                                        <div className="text-sm font-medium text-slate-900 dark:text-white truncate">
+                                            {provider.name}
+                                        </div>
+                                        <div className="text-xs text-slate-500 dark:text-text-secondary truncate">
+                                            {provider.description}
+                                        </div>
+                                    </div>
+                                </button>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
+            <div className="px-6 py-4 border-t border-gray-200 dark:border-border-dark">
+                <button
+                    type="button"
+                    onClick={toggleOnlyConfigured}
+                    disabled={!canEdit || saving}
+                    className="flex items-center gap-3 w-full text-left disabled:opacity-50"
+                >
+                    <span
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors ${
+                            onlyConfigured ? 'bg-primary' : 'bg-gray-300 dark:bg-gray-600'
+                        }`}
+                    >
+                        <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                                onlyConfigured ? 'translate-x-6' : 'translate-x-1'
+                            }`}
+                        />
+                    </span>
+                    <div>
+                        <div className="text-sm font-medium text-slate-900 dark:text-white">
+                            {t('Only sync configured providers')}
+                        </div>
+                        <div className="text-xs text-slate-500 dark:text-text-secondary">
+                            {t(
+                                'When enabled, only providers with auth files or API keys configured will be synced.'
+                            )}
+                        </div>
+                    </div>
+                </button>
+            </div>
+        </div>
+    );
 }
 
 function EditSettingModal({
@@ -534,6 +743,14 @@ export function AdminSettings() {
 
     return (
         <AdminDashboardLayout title={t('Settings')} subtitle={t('Manage fixed system settings.')}>
+            <ModelSyncSection
+                settingsMap={settingsMap}
+                setSettingsMap={setSettingsMap}
+                canUpdate={canUpdateSettings}
+                canCreate={canCreateSettings}
+                loading={loading}
+                t={t}
+            />
             <div className="bg-white dark:bg-surface-dark rounded-xl border border-gray-200 dark:border-border-dark shadow-sm overflow-hidden">
                 <div ref={tableScrollRef} className="overflow-x-auto" onScroll={handleTableScroll}>
                     <table className="w-full text-left text-sm">

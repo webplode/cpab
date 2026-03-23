@@ -26,6 +26,10 @@ const (
 	RateLimitRedisDBKey = "RATE_LIMIT_REDIS_DB"
 	// RateLimitRedisPrefixKey defines the Redis key prefix for rate limiting.
 	RateLimitRedisPrefixKey = "RATE_LIMIT_REDIS_PREFIX"
+	// ModelReferenceSyncProviderAllowlistKey limits model sync to selected providers.
+	ModelReferenceSyncProviderAllowlistKey = "MODEL_REFERENCE_SYNC_PROVIDER_ALLOWLIST"
+	// ModelReferenceSyncOnlyConfiguredProvidersKey limits model sync to providers configured locally.
+	ModelReferenceSyncOnlyConfiguredProvidersKey = "MODEL_REFERENCE_SYNC_ONLY_CONFIGURED_PROVIDERS"
 	// DefaultQuotaPollIntervalSeconds is the fallback poll interval (seconds).
 	DefaultQuotaPollIntervalSeconds = 180
 	// DefaultQuotaPollMaxConcurrency is the fallback max concurrency.
@@ -38,4 +42,8 @@ const (
 	DefaultAuthRateLimit = 5
 	// DefaultRateLimitRedisPrefix is the fallback Redis key prefix.
 	DefaultRateLimitRedisPrefix = "cpab:rl"
+	// DefaultModelReferenceSyncProviderAllowlist limits sync to supported UI providers.
+	DefaultModelReferenceSyncProviderAllowlist = "openai,anthropic,google"
+	// DefaultModelReferenceSyncOnlyConfiguredProviders limits sync to providers with auth configured.
+	DefaultModelReferenceSyncOnlyConfiguredProviders = true
 )
