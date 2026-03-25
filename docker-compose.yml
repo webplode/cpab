@@ -31,6 +31,8 @@ services:
       # Required: set JWT_SECRET to a strong random value. Generate one with: openssl rand -hex 32
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRY: ${JWT_EXPIRY:-720h}
+      # Set to "true" to log upstream request headers and body to app logs.
+      DEBUG: ${DEBUG:-false}
     depends_on:
       postgres:
         condition: service_healthy
