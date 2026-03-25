@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	sdkcliproxy "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy"
+	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 )

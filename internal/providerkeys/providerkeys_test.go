@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	sdkconfig "github.com/webplode/CLIProxyAPI/v6/sdk/config"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"gorm.io/datatypes"
 )

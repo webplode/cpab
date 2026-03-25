@@ -11,7 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 
-	cliproxyauth "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"

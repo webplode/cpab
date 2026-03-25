@@ -5,9 +5,9 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	sdkapi "github.com/webplode/CLIProxyAPI/v6/sdk/api"
-	sdkhandlers "github.com/webplode/CLIProxyAPI/v6/sdk/api/handlers"
-	sdkconfig "github.com/webplode/CLIProxyAPI/v6/sdk/config"
+	sdkapi "github.com/router-for-me/CLIProxyAPI/v6/sdk/api"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
 	relayhttp "github.com/router-for-me/CLIProxyAPIBusiness/internal/http"
 	handlers "github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/admin/handlers"

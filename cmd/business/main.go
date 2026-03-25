@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	_ "github.com/webplode/CLIProxyAPI/v6/sdk/translator/builtin"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator/builtin"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/app"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"

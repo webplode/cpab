@@ -17,7 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 
 	"github.com/gin-gonic/gin"
-	coreusage "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"

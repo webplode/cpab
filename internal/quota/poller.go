@@ -18,7 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	internalsettings "github.com/router-for-me/CLIProxyAPIBusiness/internal/settings"
 
-	coreauth "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"

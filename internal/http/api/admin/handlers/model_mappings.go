@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"gorm.io/gorm"
 )

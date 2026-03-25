@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	sdkcliproxy "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy"
+	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
