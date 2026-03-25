@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdkconfig "github.com/webplode/CLIProxyAPI/v6/sdk/config"
 	dbutil "github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"gorm.io/datatypes"

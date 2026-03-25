@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	sdkaccess "github.com/webplode/CLIProxyAPI/v6/sdk/access"
+	coreauth "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/access"
 	internalauth "github.com/router-for-me/CLIProxyAPIBusiness/internal/auth"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
@@ -33,11 +33,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/webui"
 
 	"github.com/gin-gonic/gin"
-	sdkapi "github.com/router-for-me/CLIProxyAPI/v6/sdk/api"
-	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
-	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdkapi "github.com/webplode/CLIProxyAPI/v6/sdk/api"
+	sdkhandlers "github.com/webplode/CLIProxyAPI/v6/sdk/api/handlers"
+	sdkAuth "github.com/webplode/CLIProxyAPI/v6/sdk/auth"
+	sdkcliproxy "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy"
+	sdkconfig "github.com/webplode/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 

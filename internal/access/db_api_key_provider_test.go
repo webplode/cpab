@@ -9,7 +9,7 @@ import (
 
 	"github.com/glebarez/sqlite"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+	sdkaccess "github.com/webplode/CLIProxyAPI/v6/sdk/access"
 	"gorm.io/gorm"
 )
 

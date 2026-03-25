@@ -132,8 +132,8 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
 github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
-github.com/router-for-me/CLIProxyAPI/v6 v6.8.55 h1:318SVwgSXB8Mnb5TKLCiW5Vaz9PSuImvVN26NTg/tYo=
-github.com/router-for-me/CLIProxyAPI/v6 v6.8.55/go.mod h1:7z31hDX1LapETY/Riaxei+UI8/iHuWL0Mrgokp5rqYs=
+github.com/webplode/CLIProxyAPI/v6 v6.8.55 h1:318SVwgSXB8Mnb5TKLCiW5Vaz9PSuImvVN26NTg/tYo=
+github.com/webplode/CLIProxyAPI/v6 v6.8.55/go.mod h1:7z31hDX1LapETY/Riaxei+UI8/iHuWL0Mrgokp5rqYs=
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966 h1:JIAuq3EEf9cgbU6AtGPK4CTG3Zf6CKMNqf0MHTggAUA=
@@ -166,6 +166,8 @@ github.com/twitchyliquid64/golang-asm v0.15.1 h1:SU5vSMR7hnwNxj24w34ZyCi/FmDZTkS
 github.com/twitchyliquid64/golang-asm v0.15.1/go.mod h1:a1lVb/DtPvCB8fslRZhAngC2+aY1QWCk3Cedj/Gdt08=
 github.com/ugorji/go/codec v1.2.12 h1:9LC83zGrHhuUA9l16C9AHXAqEV/2wBQ4nkvumAE65EE=
 github.com/ugorji/go/codec v1.2.12/go.mod h1:UNopzCgEMSXjBc6AOMqYvWC1ktqTAfzJZUZgYf6w6lg=
+github.com/webplode/CLIProxyAPI/v6 v6.9.2 h1:FDFsLA2+r9l6TwP2JOPFhgAogI0CFGbjaEXfrL0I0e8=
+github.com/webplode/CLIProxyAPI/v6 v6.9.2/go.mod h1:7z31hDX1LapETY/Riaxei+UI8/iHuWL0Mrgokp5rqYs=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
 go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=

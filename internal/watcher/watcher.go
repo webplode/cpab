@@ -17,9 +17,9 @@ import (
 	"time"
 	"unsafe"
 
-	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdkcliproxy "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy"
+	coreauth "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	sdkconfig "github.com/webplode/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelmapping"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/providerkeys"

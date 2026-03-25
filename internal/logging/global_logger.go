@@ -10,7 +10,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdkconfig "github.com/webplode/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/util"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/natefinch/lumberjack.v2"

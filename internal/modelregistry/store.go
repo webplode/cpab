@@ -4,7 +4,7 @@ import (
 	"strings"
 	"sync"
 
-	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
+	sdkcliproxy "github.com/webplode/CLIProxyAPI/v6/sdk/cliproxy"
 )
 
 // Store maintains in-memory model info indexed by provider and client.
