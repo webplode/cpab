@@ -36,6 +36,8 @@ CLAUDE.md
 GEMINI.md
 logs/
 
+CLIProxyAPI/.git_backup/
+
 # oh-my-claudecode state
 .omc/
 
