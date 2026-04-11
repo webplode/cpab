@@ -25,8 +25,12 @@ import (
 )
 
 const (
-	defaultPollInterval   = 3 * time.Minute
-	defaultRequestTimeout = 20 * time.Second
+	defaultPollInterval = 3 * time.Minute
+	// defaultRequestTimeout bounds a single quota poll HTTP request. Bumped
+	// from 20s because chatgpt.com/backend-api/wham/usage and the Gemini
+	// quota endpoints occasionally stall past 20s under Cloudflare slow-path
+	// routing; the 3-minute poll interval leaves plenty of headroom.
+	defaultRequestTimeout = 45 * time.Second
 	maxConcurrentRequests = 5
 	noAuthRetryInterval   = 10 * time.Second
 	maxErrorBodyBytes     = 512
