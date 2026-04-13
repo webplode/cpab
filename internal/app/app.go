@@ -97,7 +97,10 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 
 	access.RegisterDBAPIKeyProvider(conn)
 
-	jwtConfig, _ := config.LoadJWTConfig(configPath)
+	jwtConfig, errJWT := EnsureJWTConfig(configPath)
+	if errJWT != nil {
+		return fmt.Errorf("jwt config: %w", errJWT)
+	}
 	corsOrigins, err := config.LoadCORSOrigins(configPath, cfg.CORSOrigins)
 	if err != nil {
 		return err

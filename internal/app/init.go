@@ -196,6 +196,69 @@ func generateJWTSecret() (string, error) {
 	return secret, nil
 }
 
+// EnsureJWTConfig loads JWT configuration, auto-generating and persisting
+// a secret to the config file when none is configured.
+func EnsureJWTConfig(configPath string) (config.JWTConfig, error) {
+	jwtCfg, err := config.LoadJWTConfig(configPath)
+	if err == nil {
+		return jwtCfg, nil
+	}
+
+	log.Warn("no valid JWT secret found, generating one automatically")
+
+	secret, errGen := generateJWTSecret()
+	if errGen != nil {
+		return config.JWTConfig{}, fmt.Errorf("auto-generate jwt secret: %w", errGen)
+	}
+
+	if errPersist := persistJWTSecret(configPath, secret); errPersist != nil {
+		return config.JWTConfig{}, fmt.Errorf("persist jwt secret: %w", errPersist)
+	}
+
+	jwtCfg, err = config.LoadJWTConfig(configPath)
+	if err != nil {
+		return config.JWTConfig{}, fmt.Errorf("reload jwt config after generation: %w", err)
+	}
+
+	log.Info("JWT secret generated and saved to config file")
+	return jwtCfg, nil
+}
+
+// persistJWTSecret writes a JWT secret into the config file, preserving
+// any existing settings already present in the file.
+func persistJWTSecret(configPath string, secret string) error {
+	var raw map[string]any
+	data, errRead := os.ReadFile(configPath)
+	if errRead == nil {
+		_ = yaml.Unmarshal(data, &raw)
+	}
+	if raw == nil {
+		raw = make(map[string]any)
+	}
+
+	jwtSection, ok := raw["jwt"].(map[string]any)
+	if !ok {
+		jwtSection = make(map[string]any)
+	}
+	jwtSection["secret"] = secret
+	if _, hasExpiry := jwtSection["expiry"]; !hasExpiry {
+		jwtSection["expiry"] = "720h"
+	}
+	raw["jwt"] = jwtSection
+
+	out, errMarshal := yaml.Marshal(raw)
+	if errMarshal != nil {
+		return fmt.Errorf("marshal config: %w", errMarshal)
+	}
+
+	dir := filepath.Dir(configPath)
+	if errMkdir := os.MkdirAll(dir, 0755); errMkdir != nil {
+		return fmt.Errorf("create config dir: %w", errMkdir)
+	}
+
+	return os.WriteFile(configPath, out, 0600)
+}
+
 // WriteConfigFile writes the initial config file to disk.
 func WriteConfigFile(configPath string, dsn string, port int) error {
 	jwtSecret, err := generateJWTSecret()

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -35,12 +36,13 @@ type quotaListQuery struct {
 
 // quotaListRow defines the query result row for quota list.
 type quotaListRow struct {
-	ID        uint64         `gorm:"column:id"`
-	AuthID    uint64         `gorm:"column:auth_id"`
-	Type      string         `gorm:"column:type"`
-	Data      datatypes.JSON `gorm:"column:data"`
-	UpdatedAt time.Time      `gorm:"column:updated_at"`
-	AuthKey   string         `gorm:"column:auth_key"`
+	ID          uint64         `gorm:"column:id"`
+	AuthID      uint64         `gorm:"column:auth_id"`
+	Type        string         `gorm:"column:type"`
+	Data        datatypes.JSON `gorm:"column:data"`
+	UpdatedAt   time.Time      `gorm:"column:updated_at"`
+	AuthKey     string         `gorm:"column:auth_key"`
+	AuthContent datatypes.JSON `gorm:"column:auth_content"`
 }
 
 // List returns quota records with paging and filters.
@@ -111,7 +113,7 @@ func (h *QuotaHandler) List(c *gin.Context) {
 	offset := (q.Page - 1) * q.Limit
 	var rows []quotaListRow
 	if errFind := base.
-		Select("quota.id, quota.auth_id, quota.type, quota.data, quota.updated_at, auths.key AS auth_key").
+		Select("quota.id, quota.auth_id, quota.type, quota.data, quota.updated_at, auths.key AS auth_key, auths.content AS auth_content").
 		Order("auths.id ASC, quota.updated_at DESC").
 		Offset(offset).
 		Limit(q.Limit).
@@ -126,14 +128,18 @@ func (h *QuotaHandler) List(c *gin.Context) {
 		if isAntigravityType(row.Type) {
 			payload = normalizeAntigravityQuota(row.Data)
 		}
-		out = append(out, gin.H{
+		entry := gin.H{
 			"id":         row.ID,
 			"auth_id":    row.AuthID,
 			"auth_key":   row.AuthKey,
 			"type":       row.Type,
 			"data":       payload,
 			"updated_at": row.UpdatedAt,
-		})
+		}
+		if sub := extractCodexSubscription(row.Type, row.AuthContent); sub != nil {
+			entry["subscription"] = sub
+		}
+		out = append(out, entry)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -230,4 +236,69 @@ func normalizeAntigravityQuota(data datatypes.JSON) datatypes.JSON {
 		return data
 	}
 	return datatypes.JSON(updated)
+}
+
+// extractCodexSubscription extracts subscription start/until dates from a codex
+// auth's content JSON by decoding the embedded id_token JWT payload.
+func extractCodexSubscription(authType string, content datatypes.JSON) gin.H {
+	if !strings.Contains(strings.ToLower(authType), "codex") || len(content) == 0 {
+		return nil
+	}
+	var parsed struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := json.Unmarshal(content, &parsed); err != nil || parsed.Metadata == nil {
+		return nil
+	}
+	idToken, _ := parsed.Metadata["id_token"].(string)
+	if idToken == "" {
+		return nil
+	}
+	claims := decodeJWTPayload(idToken)
+	if claims == nil {
+		return nil
+	}
+	auth, _ := claims["https://api.openai.com/auth"].(map[string]any)
+	if auth == nil {
+		return nil
+	}
+	result := gin.H{}
+	if v := auth["chatgpt_plan_type"]; v != nil {
+		result["plan_type"] = v
+	}
+	if v := auth["chatgpt_subscription_active_start"]; v != nil {
+		result["active_start"] = v
+	}
+	if v := auth["chatgpt_subscription_active_until"]; v != nil {
+		result["active_until"] = v
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// decodeJWTPayload extracts the payload section of a JWT as a map without
+// verifying the signature. Returns nil if the token is malformed.
+func decodeJWTPayload(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	data := parts[1]
+	switch len(data) % 4 {
+	case 2:
+		data += "=="
+	case 3:
+		data += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(data)
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return nil
+	}
+	return claims
 }

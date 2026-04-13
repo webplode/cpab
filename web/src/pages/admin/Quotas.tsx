@@ -8,6 +8,12 @@ import { Icon } from '../../components/Icon';
 import { buildAdminPermissionKey, useAdminPermissions } from '../../utils/adminPermissions';
 import { useTranslation } from 'react-i18next';
 
+interface SubscriptionInfo {
+    plan_type?: string;
+    active_start?: unknown;
+    active_until?: unknown;
+}
+
 interface QuotaRecord {
     id: number;
     auth_id: number;
@@ -15,6 +21,7 @@ interface QuotaRecord {
     type: string;
     data: unknown;
     updated_at: string;
+    subscription?: SubscriptionInfo;
 }
 
 interface QuotaListResponse {
@@ -670,6 +677,44 @@ function formatQuotaTime(value: string | null, locale: string): string {
     return formatter.format(date);
 }
 
+function formatSubscriptionDate(value: unknown, locale: string): string {
+    if (value == null) {
+        return '';
+    }
+    let ms: number;
+    if (typeof value === 'number') {
+        ms = value > 1e12 ? value : value * 1000;
+    } else if (typeof value === 'string') {
+        ms = new Date(value).getTime();
+    } else {
+        return '';
+    }
+    if (Number.isNaN(ms)) {
+        return '';
+    }
+    const formatter = new Intl.DateTimeFormat(locale || undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+    });
+    return formatter.format(new Date(ms));
+}
+
+function isSubscriptionExpired(value: unknown): boolean {
+    if (value == null) {
+        return false;
+    }
+    let ms: number;
+    if (typeof value === 'number') {
+        ms = value > 1e12 ? value : value * 1000;
+    } else if (typeof value === 'string') {
+        ms = new Date(value).getTime();
+    } else {
+        return false;
+    }
+    return !Number.isNaN(ms) && ms < Date.now();
+}
+
 function formatTypeLabel(value: string, fallback: string): string {
     const trimmed = value.trim();
     if (!trimmed) {
@@ -976,6 +1021,20 @@ export function AdminQuotas() {
                                         {quota.auth_key}
                                     </div>
                                 </div>
+                                {quota.subscription?.active_until != null && (() => {
+                                    const expired = isSubscriptionExpired(quota.subscription.active_until);
+                                    const untilLabel = formatSubscriptionDate(quota.subscription.active_until, i18n.language);
+                                    return untilLabel ? (
+                                        <div className={`flex items-center gap-2 text-xs px-2 py-1.5 rounded-lg ${
+                                            expired
+                                                ? 'bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400'
+                                                : 'bg-blue-50 text-blue-600 dark:bg-blue-900/20 dark:text-blue-400'
+                                        }`}>
+                                            <span>{expired ? t('Expired') : t('Subscription')}</span>
+                                            <span className="font-semibold">{untilLabel}</span>
+                                        </div>
+                                    ) : null;
+                                })()}
                                 <div className="border-t border-dashed border-gray-200 dark:border-border-dark" />
                                 <AutoScrollList className="flex flex-col gap-4 max-h-72 overflow-y-auto scrollbar-hidden pr-1">
                                     {quota.items.length === 0 ? (
