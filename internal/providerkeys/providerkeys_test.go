@@ -45,6 +45,27 @@ func TestApplyToConfig_Gemini(t *testing.T) {
 	}
 }
 
+func TestApplyToConfig_ClaudeAuthMode(t *testing.T) {
+	rows := []models.ProviderAPIKey{
+		{
+			Provider: "claude",
+			APIKey:   "claude-key",
+			BaseURL:  "https://claude.example.com",
+			AuthMode: "x-api-key",
+		},
+	}
+
+	cfg := &sdkconfig.Config{}
+	ApplyToConfig(cfg, rows, nil)
+
+	if len(cfg.ClaudeKey) != 1 {
+		t.Fatalf("expected 1 claude key, got %d", len(cfg.ClaudeKey))
+	}
+	if got := cfg.ClaudeKey[0].AuthMode; got != sdkconfig.ClaudeAuthModeXAPIKey {
+		t.Fatalf("AuthMode = %q, want %q", got, sdkconfig.ClaudeAuthModeXAPIKey)
+	}
+}
+
 func TestApplyToConfig_OAuthModelAlias(t *testing.T) {
 	rows := []models.ModelMapping{
 		{Provider: "claude", ModelName: "claude-sonnet", NewModelName: "sonnet", Fork: true, IsEnabled: true},

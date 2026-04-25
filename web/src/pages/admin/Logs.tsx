@@ -7,24 +7,33 @@ import { apiFetchAdmin } from '../../api/config';
 import { buildAdminPermissionKey, useAdminPermissions } from '../../utils/adminPermissions';
 import { useTranslation } from 'react-i18next';
 
-interface ModelDropdownMenuProps {
-    models: string[];
-    modelFilter: string;
+interface OptionDropdownMenuProps {
+    anchorId: string;
+    allLabel: string;
+    options: string[];
+    selectedValue: string;
     menuWidth?: number;
     onSelect: (value: string) => void;
     onClose: () => void;
 }
 
-function ModelDropdownMenu({ models, modelFilter, menuWidth, onSelect, onClose }: ModelDropdownMenuProps) {
-    const { t } = useTranslation();
+function OptionDropdownMenu({
+    anchorId,
+    allLabel,
+    options,
+    selectedValue,
+    menuWidth,
+    onSelect,
+    onClose,
+}: OptionDropdownMenuProps) {
     const menuRef = useRef<HTMLDivElement>(null);
-    const btn = document.getElementById('admin-model-dropdown-btn');
+    const btn = document.getElementById(anchorId);
     const rect = btn ? btn.getBoundingClientRect() : null;
     const position = rect
         ? { top: rect.bottom + 4, left: rect.left, width: rect.width }
         : { top: 0, left: 0, width: 0 };
 
-    const options = [{ value: '', label: t('All Models') }, ...models.map((m) => ({ value: m, label: m }))];
+    const items = [{ value: '', label: allLabel }, ...options.map((option) => ({ value: option, label: option }))];
 
     return createPortal(
         <>
@@ -34,13 +43,13 @@ function ModelDropdownMenu({ models, modelFilter, menuWidth, onSelect, onClose }
                 className="fixed z-50 bg-white dark:bg-surface-dark border border-gray-200 dark:border-border-dark rounded-lg shadow-lg overflow-hidden max-h-64 overflow-y-auto"
                 style={{ top: position.top, left: position.left, width: position.width || menuWidth }}
             >
-                {options.map((opt) => (
+                {items.map((opt) => (
                     <button
                         key={opt.value}
                         type="button"
                         onClick={() => onSelect(opt.value)}
                         className={`w-full text-left px-4 py-2.5 text-sm truncate hover:bg-gray-100 dark:hover:bg-background-dark transition-colors ${
-                            modelFilter === opt.value
+                            selectedValue === opt.value
                                 ? 'bg-gray-100 dark:bg-background-dark text-primary font-medium'
                                 : 'text-slate-900 dark:text-white'
                         }`}
@@ -96,6 +105,10 @@ interface ListResponse {
 
 interface ModelsResponse {
     models: string[];
+}
+
+interface ProvidersResponse {
+    providers: string[];
 }
 
 interface LogDetail {
@@ -183,6 +196,7 @@ export function AdminLogs() {
     const [logs, setLogs] = useState<LogEntry[]>([]);
     const [stats, setStats] = useState<LogsStats | null>(null);
     const [models, setModels] = useState<string[]>([]);
+    const [providers, setProviders] = useState<string[]>([]);
     const [loading, setLoading] = useState(true);
     const [page, setPage] = useState(1);
     const [total, setTotal] = useState(0);
@@ -190,8 +204,11 @@ export function AdminLogs() {
     const [startDate, setStartDate] = useState('');
     const [endDate, setEndDate] = useState('');
     const [modelFilter, setModelFilter] = useState('');
+    const [providerFilter, setProviderFilter] = useState('');
     const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
+    const [providerDropdownOpen, setProviderDropdownOpen] = useState(false);
     const [modelBtnWidth, setModelBtnWidth] = useState<number | undefined>(undefined);
+    const [providerBtnWidth, setProviderBtnWidth] = useState<number | undefined>(undefined);
     const [detailModalOpen, setDetailModalOpen] = useState(false);
     const [detailLoading, setDetailLoading] = useState(false);
     const [detailItems, setDetailItems] = useState<LogDetail[]>([]);
@@ -204,12 +221,13 @@ export function AdminLogs() {
     const canListLogs = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/logs'));
     const canViewStats = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/logs/stats'));
     const canViewModels = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/logs/models'));
+    const canViewProviders = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/logs/providers'));
     const canViewDetail = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/logs/detail'));
     const hasAnyAccess = canListLogs || canViewStats;
     const shouldShowFilters = canListLogs;
 
     useEffect(() => {
-        const allOptions = ['All Models', ...models];
+        const allOptions = [t('All Models'), ...models];
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         if (ctx) {
@@ -221,14 +239,30 @@ export function AdminLogs() {
             }
             setModelBtnWidth(Math.ceil(maxWidth) + 96);
         }
-    }, [models]);
+    }, [models, t]);
+
+    useEffect(() => {
+        const allOptions = [t('All Providers'), ...providers];
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+            ctx.font = '14px ui-sans-serif, system-ui, sans-serif';
+            let maxWidth = 0;
+            for (const opt of allOptions) {
+                const width = ctx.measureText(opt).width;
+                if (width > maxWidth) maxWidth = width;
+            }
+            setProviderBtnWidth(Math.ceil(maxWidth) + 96);
+        }
+    }, [providers, t]);
 
     const fetchData = useCallback(async () => {
-        if (!canListLogs && !canViewStats && !canViewModels) {
+        if (!canListLogs && !canViewStats && !canViewModels && !canViewProviders) {
             setLogs([]);
             setTotal(0);
             setStats(null);
             setModels([]);
+            setProviders([]);
             setLoading(false);
             return;
         }
@@ -243,18 +277,22 @@ export function AdminLogs() {
                 if (startDate) params.set('start_date', startDate);
                 if (endDate) params.set('end_date', endDate);
                 if (modelFilter) params.set('model', modelFilter);
+                if (providerFilter) params.set('provider', providerFilter);
             }
 
-            const [listRes, statsRes, modelsRes] = await Promise.all([
+            const [listRes, statsRes, modelsRes, providersRes] = await Promise.all([
                 canListLogs
                     ? apiFetchAdmin<ListResponse>(`/v0/admin/logs?${params.toString()}`)
                     : Promise.resolve<ListResponse | null>(null),
                 canViewStats
-                    ? apiFetchAdmin<LogsStats>('/v0/admin/logs/stats')
+                    ? apiFetchAdmin<LogsStats>(`/v0/admin/logs/stats?${params.toString()}`)
                     : Promise.resolve<LogsStats | null>(null),
                 canViewModels
-                    ? apiFetchAdmin<ModelsResponse>('/v0/admin/logs/models')
+                    ? apiFetchAdmin<ModelsResponse>(`/v0/admin/logs/models?${params.toString()}`)
                     : Promise.resolve<ModelsResponse | null>(null),
+                canViewProviders
+                    ? apiFetchAdmin<ProvidersResponse>(`/v0/admin/logs/providers?${params.toString()}`)
+                    : Promise.resolve<ProvidersResponse | null>(null),
             ]);
 
             if (listRes) {
@@ -276,21 +314,29 @@ export function AdminLogs() {
             } else {
                 setModels([]);
             }
+
+            if (providersRes) {
+                setProviders(providersRes.providers || []);
+            } else {
+                setProviders([]);
+            }
         } catch (err) {
             console.error('Failed to fetch logs:', err);
         } finally {
             setLoading(false);
         }
-    }, [
+      }, [
         page,
         limit,
-        startDate,
-        endDate,
-        modelFilter,
-        canListLogs,
-        canViewStats,
-        canViewModels,
-    ]);
+          startDate,
+          endDate,
+          modelFilter,
+          providerFilter,
+          canListLogs,
+          canViewStats,
+          canViewModels,
+          canViewProviders,
+      ]);
 
     useEffect(() => {
         fetchData();
@@ -381,7 +427,7 @@ export function AdminLogs() {
 
     const statsCards = [
         {
-            label: t('Requests Today'),
+            label: t('Requests'),
             value: stats?.requests_today_display ?? '0',
             icon: 'api',
             iconColor: 'text-blue-500',
@@ -402,7 +448,7 @@ export function AdminLogs() {
             icon: 'timer',
             iconColor: 'text-orange-500',
             change: `${stats?.request_time_change && stats.request_time_change >= 0 ? '+' : ''}${(stats?.request_time_change ?? 0).toFixed(0)}%`,
-            positive: (stats?.request_time_change ?? 0) >= 0,
+            positive: (stats?.request_time_change ?? 0) <= 0,
         },
         {
             label: t('Error Rate'),
@@ -462,16 +508,33 @@ export function AdminLogs() {
                                     <input
                                         type="date"
                                         value={startDate}
-                                        onChange={(e) => setStartDate(e.target.value)}
+                                        onChange={(e) => {
+                                            setStartDate(e.target.value);
+                                            setPage(1);
+                                        }}
                                         className="px-3 py-2 text-sm border border-gray-200 dark:border-border-dark rounded-lg bg-white dark:bg-background-dark text-slate-900 dark:text-white"
                                     />
                                     <span className="text-slate-400">{t('to')}</span>
                                     <input
                                         type="date"
                                         value={endDate}
-                                        onChange={(e) => setEndDate(e.target.value)}
+                                        onChange={(e) => {
+                                            setEndDate(e.target.value);
+                                            setPage(1);
+                                        }}
                                         className="px-3 py-2 text-sm border border-gray-200 dark:border-border-dark rounded-lg bg-white dark:bg-background-dark text-slate-900 dark:text-white"
                                     />
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setStartDate('');
+                                            setEndDate('');
+                                            setPage(1);
+                                        }}
+                                        className="px-3 py-2 text-sm border border-gray-200 dark:border-border-dark rounded-lg bg-gray-50 dark:bg-background-dark text-slate-900 dark:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                                    >
+                                        {t('All Time')}
+                                    </button>
                                 </div>
                                 {canViewModels && (
                                     <div className="relative">
@@ -489,15 +552,50 @@ export function AdminLogs() {
                                             <Icon name="expand_more" size={18} />
                                         </button>
                                         {modelDropdownOpen && (
-                                            <ModelDropdownMenu
-                                                models={models}
-                                                modelFilter={modelFilter}
+                                            <OptionDropdownMenu
+                                                anchorId="admin-model-dropdown-btn"
+                                                allLabel={t('All Models')}
+                                                options={models}
+                                                selectedValue={modelFilter}
                                                 menuWidth={modelBtnWidth}
                                                 onSelect={(value) => {
                                                     setModelFilter(value);
+                                                    setPage(1);
                                                     setModelDropdownOpen(false);
                                                 }}
                                                 onClose={() => setModelDropdownOpen(false)}
+                                            />
+                                        )}
+                                    </div>
+                                )}
+                                {canViewProviders && (
+                                    <div className="relative">
+                                        <button
+                                            id="admin-provider-dropdown-btn"
+                                            type="button"
+                                            onClick={() => setProviderDropdownOpen(!providerDropdownOpen)}
+                                            className="flex items-center justify-between gap-2 px-4 py-2 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors whitespace-nowrap"
+                                            style={providerBtnWidth ? { width: providerBtnWidth } : undefined}
+                                        >
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <Icon name="hub" size={18} />
+                                                <span className="whitespace-nowrap">{providerFilter || t('All Providers')}</span>
+                                            </div>
+                                            <Icon name="expand_more" size={18} />
+                                        </button>
+                                        {providerDropdownOpen && (
+                                            <OptionDropdownMenu
+                                                anchorId="admin-provider-dropdown-btn"
+                                                allLabel={t('All Providers')}
+                                                options={providers}
+                                                selectedValue={providerFilter}
+                                                menuWidth={providerBtnWidth}
+                                                onSelect={(value) => {
+                                                    setProviderFilter(value);
+                                                    setPage(1);
+                                                    setProviderDropdownOpen(false);
+                                                }}
+                                                onClose={() => setProviderDropdownOpen(false)}
                                             />
                                         )}
                                     </div>

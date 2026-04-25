@@ -82,8 +82,8 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	authed.PUT("/proxies/:id", proxyHandler.Update)
 	authed.DELETE("/proxies/:id", proxyHandler.Delete)
 
-	usageHandler := handlers.NewUsageHandler(db)
-	authed.GET("/usage", usageHandler.List)
+	usageHandler := handlers.NewAdminUsageHandler(db)
+	authed.GET("/usage", usageHandler.Overview)
 
 	billingHandler := handlers.NewBillingHandler(db)
 	authed.GET("/billing/summary", billingHandler.Summary)
@@ -171,6 +171,7 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	authed.POST("/model-mappings", modelMappingHandler.Create)
 	authed.GET("/model-mappings", modelMappingHandler.List)
 	authed.GET("/model-mappings/available-models", modelMappingHandler.AvailableModels)
+	authed.POST("/model-mappings/refresh-supported-models", modelMappingHandler.RefreshSupportedModels)
 	authed.GET("/model-mappings/:id", modelMappingHandler.Get)
 	authed.PUT("/model-mappings/:id", modelMappingHandler.Update)
 	authed.DELETE("/model-mappings/:id", modelMappingHandler.Delete)
@@ -192,6 +193,7 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	authed.GET("/logs/stats", logsHandler.Stats)
 	authed.GET("/logs/trend", logsHandler.Trend)
 	authed.GET("/logs/models", logsHandler.Models)
+	authed.GET("/logs/providers", logsHandler.Providers)
 	authed.GET("/logs/projects", logsHandler.Projects)
 
 	planHandler := handlers.NewPlanHandler(db)
@@ -223,9 +225,7 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 		authed.POST("/tokens/gemini", tokenRequester.RequestGeminiCLIToken)
 		authed.POST("/tokens/codex", tokenRequester.RequestCodexToken)
 		authed.POST("/tokens/antigravity", tokenRequester.RequestAntigravityToken)
-		authed.POST("/tokens/qwen", tokenRequester.RequestQwenToken)
-		authed.POST("/tokens/iflow", tokenRequester.RequestIFlowToken)
-		authed.POST("/tokens/iflow-cookie", tokenRequester.RequestIFlowCookieToken)
+		authed.POST("/tokens/kimi", tokenRequester.RequestKimiToken)
 		authed.POST("/tokens/get-auth-status", tokenRequester.GetAuthStatus)
 		authed.POST("/tokens/oauth-callback", tokenRequester.PostOAuthCallback)
 	}

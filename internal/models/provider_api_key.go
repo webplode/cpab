@@ -17,6 +17,7 @@ type ProviderAPIKey struct {
 	Prefix   string `gorm:"type:text"`                       // Key prefix to apply.
 	BaseURL  string `gorm:"type:text"`                       // Base URL override.
 	ProxyURL string `gorm:"type:text"`                       // Proxy URL override.
+	AuthMode string `gorm:"type:text"`                       // Claude auth header mode override.
 
 	Headers        datatypes.JSON `gorm:"type:jsonb"` // Extra request headers.
 	Models         datatypes.JSON `gorm:"type:jsonb"` // Allowed models list.

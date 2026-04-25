@@ -30,6 +30,7 @@ interface ProviderApiKey {
     prefix: string;
     base_url: string;
     proxy_url: string;
+    auth_mode?: string;
     headers?: Record<string, string>;
     models?: ModelAlias[];
     excluded_models?: string[];
@@ -158,6 +159,7 @@ function ApiKeyModal({ mode, initial, providerMenuWidth, onClose, onSuccess }: A
     const [prefix, setPrefix] = useState(initial?.prefix || '');
     const [baseURL, setBaseURL] = useState(initial?.base_url || '');
     const [proxyURL, setProxyURL] = useState(initial?.proxy_url || '');
+    const [authMode, setAuthMode] = useState(initial?.auth_mode || 'auto');
     const [headersList, setHeadersList] = useState<{ key: string; value: string }[]>(
         initial?.headers
             ? (() => {
@@ -310,18 +312,19 @@ function ApiKeyModal({ mode, initial, providerMenuWidth, onClose, onSuccess }: A
             .map((item) => ({ name: item.name.trim(), alias: item.alias.trim() }))
             .filter((item) => item.name || item.alias);
 
-        const payload = {
-            provider,
-            name: name.trim(),
-            priority,
-            api_key: apiKey.trim(),
-            prefix: prefix.trim(),
-            base_url: baseURL.trim(),
-            proxy_url: proxyURL.trim(),
-            headers: Object.keys(normalizedHeaders).length ? normalizedHeaders : undefined,
-            models: normalizedModels,
-            excluded_models: excludedModels,
-            api_key_entries: apiKeyEntries,
+          const payload = {
+              provider,
+              name: name.trim(),
+              priority,
+              api_key: apiKey.trim(),
+              prefix: prefix.trim(),
+              base_url: baseURL.trim(),
+              proxy_url: proxyURL.trim(),
+              auth_mode: provider === 'claude' ? authMode : undefined,
+              headers: Object.keys(normalizedHeaders).length ? normalizedHeaders : undefined,
+              models: normalizedModels,
+              excluded_models: excludedModels,
+              api_key_entries: apiKeyEntries,
         };
 
         setSubmitting(true);
@@ -465,20 +468,40 @@ function ApiKeyModal({ mode, initial, providerMenuWidth, onClose, onSuccess }: A
                         </div>
                     </div>
 
-                    {provider !== 'openai-compatibility' && (
-                        <div>
-                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-                                {t('Proxy URL')}
-                            </label>
+                      {provider !== 'openai-compatibility' && (
+                          <div>
+                              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                                  {t('Proxy URL')}
+                              </label>
                             <input
                                 type="text"
                                 value={proxyURL}
                                 onChange={(e) => setProxyURL(e.target.value)}
                                 placeholder={t('optional proxy url')}
                                 className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
-                            />
-                        </div>
-                    )}
+                              />
+                          </div>
+                      )}
+
+                      {provider === 'claude' && (
+                          <div>
+                              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                                  {t('Auth Mode')}
+                              </label>
+                              <select
+                                  value={authMode}
+                                  onChange={(e) => setAuthMode(e.target.value)}
+                                  className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                              >
+                                  <option value="auto">{t('Auto')}</option>
+                                  <option value="x-api-key">{t('Anthropic x-api-key')}</option>
+                                  <option value="bearer">{t('Bearer Authorization')}</option>
+                              </select>
+                              <p className="mt-1.5 text-xs text-gray-500 dark:text-gray-400">
+                                  {t('Choose Anthropic x-api-key for custom /v1/messages endpoints that expect Anthropic-compatible auth.')}
+                              </p>
+                          </div>
+                      )}
 
                     <div>
                         <div className="flex items-center justify-between mb-1.5">

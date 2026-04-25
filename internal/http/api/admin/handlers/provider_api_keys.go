@@ -78,6 +78,7 @@ type createProviderAPIKeyRequest struct {
 	Prefix         *string           `json:"prefix"`          // Optional prefix.
 	BaseURL        *string           `json:"base_url"`        // Optional base URL.
 	ProxyURL       *string           `json:"proxy_url"`       // Optional proxy URL.
+	AuthMode       *string           `json:"auth_mode"`       // Optional Claude auth mode.
 	Headers        map[string]string `json:"headers"`         // Request headers.
 	Models         []modelAlias      `json:"models"`          // Model aliases.
 	ExcludedModels []string          `json:"excluded_models"` // Excluded models.
@@ -93,6 +94,7 @@ type updateProviderAPIKeyRequest struct {
 	Prefix         *string            `json:"prefix"`          // Optional prefix.
 	BaseURL        *string            `json:"base_url"`        // Optional base URL.
 	ProxyURL       *string            `json:"proxy_url"`       // Optional proxy URL.
+	AuthMode       *string            `json:"auth_mode"`       // Optional Claude auth mode.
 	Headers        *map[string]string `json:"headers"`         // Optional headers.
 	Models         *[]modelAlias      `json:"models"`          // Optional model aliases.
 	ExcludedModels *[]string          `json:"excluded_models"` // Optional excluded models.
@@ -134,6 +136,7 @@ func (h *ProviderAPIKeyHandler) Create(c *gin.Context) {
 		Prefix:    strings.TrimSpace(derefString(body.Prefix)),
 		BaseURL:   strings.TrimSpace(derefString(body.BaseURL)),
 		ProxyURL:  proxyURL,
+		AuthMode:  sdkconfig.NormalizeClaudeAuthMode(derefString(body.AuthMode)),
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -341,6 +344,9 @@ func (h *ProviderAPIKeyHandler) Update(c *gin.Context) {
 	if body.ProxyURL != nil {
 		row.ProxyURL = strings.TrimSpace(*body.ProxyURL)
 	}
+	if body.AuthMode != nil {
+		row.AuthMode = sdkconfig.NormalizeClaudeAuthMode(*body.AuthMode)
+	}
 	if body.Headers != nil {
 		headersJSON, errHeaders := marshalJSON(*body.Headers)
 		if errHeaders != nil {
@@ -493,6 +499,7 @@ func (h *ProviderAPIKeyHandler) syncSDKConfig(ctx context.Context) error {
 				Prefix:   strings.TrimSpace(row.Prefix),
 				BaseURL:  strings.TrimSpace(row.BaseURL),
 				ProxyURL: strings.TrimSpace(row.ProxyURL),
+				AuthMode: sdkconfig.NormalizeClaudeAuthMode(row.AuthMode),
 				Headers:  decodeHeaders(row.Headers),
 			}
 			applyJSON(row.Models, &entry.Models)
@@ -587,9 +594,13 @@ func normalizeProviderFields(row *models.ProviderAPIKey) {
 	case providerOpenAI:
 		row.APIKey = ""
 		row.ProxyURL = ""
+		row.AuthMode = ""
 		row.ExcludedModels = nil
+	case providerClaude:
+		row.AuthMode = sdkconfig.NormalizeClaudeAuthMode(row.AuthMode)
 	default:
 		row.Name = ""
+		row.AuthMode = ""
 		row.APIKeyEntries = nil
 	}
 }
@@ -614,6 +625,9 @@ func validateProviderRow(row *models.ProviderAPIKey) error {
 	case providerClaude:
 		if strings.TrimSpace(row.APIKey) == "" {
 			return errors.New("api_key is required")
+		}
+		if !isValidClaudeAuthMode(row.AuthMode) {
+			return errors.New("invalid auth_mode")
 		}
 	case providerOpenAI:
 		if strings.TrimSpace(row.Name) == "" {
@@ -731,6 +745,13 @@ func formatProviderRow(row *models.ProviderAPIKey) gin.H {
 	if row == nil {
 		return gin.H{}
 	}
+	authMode := ""
+	if normalizeProvider(row.Provider) == providerClaude {
+		authMode = sdkconfig.NormalizeClaudeAuthMode(row.AuthMode)
+		if authMode == "" {
+			authMode = "auto"
+		}
+	}
 	return gin.H{
 		"id":              row.ID,
 		"provider":        row.Provider,
@@ -740,11 +761,21 @@ func formatProviderRow(row *models.ProviderAPIKey) gin.H {
 		"prefix":          row.Prefix,
 		"base_url":        row.BaseURL,
 		"proxy_url":       row.ProxyURL,
+		"auth_mode":       authMode,
 		"headers":         decodeHeaders(row.Headers),
 		"models":          decodeModels(row.Models),
 		"excluded_models": decodeExcludedModels(row.ExcludedModels),
 		"api_key_entries": decodeAPIKeyEntries(row.APIKeyEntries),
 		"created_at":      row.CreatedAt,
 		"updated_at":      row.UpdatedAt,
+	}
+}
+
+func isValidClaudeAuthMode(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto", "x-api-key", "x_api_key", "api-key", "anthropic-api-key", "anthropic_api_key", "bearer", "authorization", "authorization-bearer":
+		return true
+	default:
+		return false
 	}
 }

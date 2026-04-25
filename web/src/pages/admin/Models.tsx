@@ -30,6 +30,16 @@ interface ListResponse {
     model_mappings: ModelMapping[];
 }
 
+interface AvailableModelsResponse {
+    models: string[];
+}
+
+interface SupportedModelsRefreshResponse {
+    ok: boolean;
+    source?: string;
+    changed_providers?: string[];
+}
+
 interface UserGroup {
     id: number;
     name: string;
@@ -264,14 +274,33 @@ function getModelMappingSelectorLabel(selector: number, t: Translate): string {
     return match ? t(match.labelKey) : String(selector);
 }
 
+async function fetchAvailableModelsForProvider(provider: string): Promise<string[]> {
+    if (!provider.trim()) {
+        return [];
+    }
+    const res = await apiFetchAdmin<AvailableModelsResponse>(
+        `/v0/admin/model-mappings/available-models?provider=${encodeURIComponent(provider)}`
+    );
+    return res.models || [];
+}
+
 interface CreateModalProps {
     onClose: () => void;
     onSuccess: () => void;
     canLoadModels: boolean;
+    canRefreshSupportedModels: boolean;
+    onRefreshSupportedModels: () => Promise<boolean>;
     userGroups: UserGroup[];
 }
 
-function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateModalProps) {
+function CreateModal({
+    onClose,
+    onSuccess,
+    canLoadModels,
+    canRefreshSupportedModels,
+    onRefreshSupportedModels,
+    userGroups,
+}: CreateModalProps) {
     const { t } = useTranslation();
     const providerOptions = buildProviderOptions(t);
     const selectorOptions = buildModelMappingSelectorOptions(t);
@@ -287,6 +316,7 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
     const [selectorDropdownOpen, setSelectorDropdownOpen] = useState(false);
     const [models, setModels] = useState<string[]>([]);
     const [loadingModels, setLoadingModels] = useState(false);
+    const [refreshingModels, setRefreshingModels] = useState(false);
     const [submitting, setSubmitting] = useState(false);
     const [userGroupIds, setUserGroupIds] = useState<number[]>([]);
     const [userGroupMenuOpen, setUserGroupMenuOpen] = useState(false);
@@ -296,6 +326,27 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
     const providerBtnRef = useRef<HTMLButtonElement>(null);
     const modelBtnRef = useRef<HTMLInputElement>(null);
     const selectorBtnRef = useRef<HTMLButtonElement>(null);
+
+    const loadModelsForProvider = useCallback(async (providerValue: string) => {
+        if (!providerValue) {
+            setModels([]);
+            setModelName('');
+            return;
+        }
+        if (!canLoadModels) {
+            setModels([]);
+            setModelName('');
+            return;
+        }
+        setLoadingModels(true);
+        try {
+            setModels(await fetchAvailableModelsForProvider(providerValue));
+        } catch {
+            setModels([]);
+        } finally {
+            setLoadingModels(false);
+        }
+    }, [canLoadModels]);
 
     useEffect(() => {
         const allOptions = [t('All Groups'), ...userGroups.map((g) => `${g.name} #${g.id}`)];
@@ -318,25 +369,23 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
             setModelName('');
             return;
         }
-        if (!canLoadModels) {
-            setModels([]);
-            setModelName('');
+        void loadModelsForProvider(provider);
+    }, [provider, loadModelsForProvider]);
+
+    const handleRefreshModels = async () => {
+        if (!canRefreshSupportedModels || refreshingModels) {
             return;
         }
-        setLoadingModels(true);
-        apiFetchAdmin<{ models: string[] }>(
-            `/v0/admin/model-mappings/available-models?provider=${encodeURIComponent(provider)}`
-        )
-            .then((res) => {
-                setModels(res.models || []);
-            })
-            .catch(() => {
-                setModels([]);
-            })
-            .finally(() => {
-                setLoadingModels(false);
-            });
-    }, [provider, canLoadModels]);
+        setRefreshingModels(true);
+        try {
+            const refreshed = await onRefreshSupportedModels();
+            if (refreshed && provider) {
+                await loadModelsForProvider(provider);
+            }
+        } finally {
+            setRefreshingModels(false);
+        }
+    };
 
     const handleSubmit = async () => {
         if (!provider || !modelName || !newModelName) return;
@@ -426,7 +475,7 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
                                     ref={modelBtnRef}
                                     type="text"
                                     value={modelName}
-                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    disabled={!provider || loadingModels || refreshingModels || !canLoadModels}
                                     onChange={(e) => {
                                         setModelName(e.target.value);
                                         if (!modelDropdownOpen) setModelDropdownOpen(true);
@@ -435,23 +484,37 @@ function CreateModal({ onClose, onSuccess, canLoadModels, userGroups }: CreateMo
                                     placeholder={
                                         !canLoadModels
                                             ? t('No permission to load models')
-                                            : loadingModels
+                                            : loadingModels || refreshingModels
                                                 ? t('Loading...')
                                                 : t('Type or select model')
                                     }
-                                    className="w-full px-4 py-2.5 pr-9 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="w-full px-4 py-2.5 pr-20 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
                                 />
                                 <button
                                     type="button"
                                     tabIndex={-1}
-                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    disabled={!canRefreshSupportedModels || refreshingModels}
+                                    onClick={() => void handleRefreshModels()}
+                                    className="absolute right-8 top-1/2 -translate-y-1/2 text-gray-400 hover:text-primary disabled:opacity-50"
+                                    title={t('Refresh supported models')}
+                                >
+                                    <Icon
+                                        name="refresh"
+                                        size={16}
+                                        className={refreshingModels ? 'animate-spin' : ''}
+                                    />
+                                </button>
+                                <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    disabled={!provider || loadingModels || refreshingModels || !canLoadModels}
                                     onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
                                     className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
                                 >
                                     <Icon
-                                        name={loadingModels ? 'progress_activity' : 'expand_more'}
+                                        name={loadingModels || refreshingModels ? 'progress_activity' : 'expand_more'}
                                         size={18}
-                                        className={loadingModels ? 'animate-spin' : ''}
+                                        className={loadingModels || refreshingModels ? 'animate-spin' : ''}
                                     />
                                 </button>
                             </div>
@@ -651,10 +714,20 @@ interface EditModalProps {
     onClose: () => void;
     onSuccess: (updated: ModelMapping) => void;
     canLoadModels: boolean;
+    canRefreshSupportedModels: boolean;
+    onRefreshSupportedModels: () => Promise<boolean>;
     userGroups: UserGroup[];
 }
 
-function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: EditModalProps) {
+function EditModal({
+    mapping,
+    onClose,
+    onSuccess,
+    canLoadModels,
+    canRefreshSupportedModels,
+    onRefreshSupportedModels,
+    userGroups,
+}: EditModalProps) {
     const { t } = useTranslation();
     const providerOptions = buildProviderOptions(t);
     const selectorOptions = buildModelMappingSelectorOptions(t);
@@ -670,6 +743,7 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
     const [selectorDropdownOpen, setSelectorDropdownOpen] = useState(false);
     const [models, setModels] = useState<string[]>([]);
     const [loadingModels, setLoadingModels] = useState(false);
+    const [refreshingModels, setRefreshingModels] = useState(false);
     const [submitting, setSubmitting] = useState(false);
     const [userGroupIds, setUserGroupIds] = useState<number[]>(mapping.user_group_id ?? []);
     const [userGroupMenuOpen, setUserGroupMenuOpen] = useState(false);
@@ -679,6 +753,25 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
     const providerBtnRef = useRef<HTMLButtonElement>(null);
     const modelBtnRef = useRef<HTMLInputElement>(null);
     const selectorBtnRef = useRef<HTMLButtonElement>(null);
+
+    const loadModelsForProvider = useCallback(async (providerValue: string) => {
+        if (!providerValue) {
+            setModels([]);
+            return;
+        }
+        if (!canLoadModels) {
+            setModels([]);
+            return;
+        }
+        setLoadingModels(true);
+        try {
+            setModels(await fetchAvailableModelsForProvider(providerValue));
+        } catch {
+            setModels([]);
+        } finally {
+            setLoadingModels(false);
+        }
+    }, [canLoadModels]);
 
     useEffect(() => {
         const allOptions = [t('All Groups'), ...userGroups.map((g) => `${g.name} #${g.id}`)];
@@ -700,24 +793,23 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
             setModels([]);
             return;
         }
-        if (!canLoadModels) {
-            setModels([]);
+        void loadModelsForProvider(provider);
+    }, [provider, loadModelsForProvider]);
+
+    const handleRefreshModels = async () => {
+        if (!canRefreshSupportedModels || refreshingModels) {
             return;
         }
-        setLoadingModels(true);
-        apiFetchAdmin<{ models: string[] }>(
-            `/v0/admin/model-mappings/available-models?provider=${encodeURIComponent(provider)}`
-        )
-            .then((res) => {
-                setModels(res.models || []);
-            })
-            .catch(() => {
-                setModels([]);
-            })
-            .finally(() => {
-                setLoadingModels(false);
-            });
-    }, [provider, canLoadModels]);
+        setRefreshingModels(true);
+        try {
+            const refreshed = await onRefreshSupportedModels();
+            if (refreshed && provider) {
+                await loadModelsForProvider(provider);
+            }
+        } finally {
+            setRefreshingModels(false);
+        }
+    };
 
     const handleSubmit = async () => {
         if (!provider || !modelName || !newModelName) return;
@@ -817,7 +909,7 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
                                     ref={modelBtnRef}
                                     type="text"
                                     value={modelName}
-                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    disabled={!provider || loadingModels || refreshingModels || !canLoadModels}
                                     onChange={(e) => {
                                         setModelName(e.target.value);
                                         if (!modelDropdownOpen) setModelDropdownOpen(true);
@@ -826,23 +918,37 @@ function EditModal({ mapping, onClose, onSuccess, canLoadModels, userGroups }: E
                                     placeholder={
                                         !canLoadModels
                                             ? t('No permission to load models')
-                                            : loadingModels
+                                            : loadingModels || refreshingModels
                                                 ? t('Loading...')
                                                 : t('Type or select model')
                                     }
-                                    className="w-full px-4 py-2.5 pr-9 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="w-full px-4 py-2.5 pr-20 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
                                 />
                                 <button
                                     type="button"
                                     tabIndex={-1}
-                                    disabled={!provider || loadingModels || !canLoadModels}
+                                    disabled={!canRefreshSupportedModels || refreshingModels}
+                                    onClick={() => void handleRefreshModels()}
+                                    className="absolute right-8 top-1/2 -translate-y-1/2 text-gray-400 hover:text-primary disabled:opacity-50"
+                                    title={t('Refresh supported models')}
+                                >
+                                    <Icon
+                                        name="refresh"
+                                        size={16}
+                                        className={refreshingModels ? 'animate-spin' : ''}
+                                    />
+                                </button>
+                                <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    disabled={!provider || loadingModels || refreshingModels || !canLoadModels}
                                     onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
                                     className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-50"
                                 >
                                     <Icon
-                                        name={loadingModels ? 'progress_activity' : 'expand_more'}
+                                        name={loadingModels || refreshingModels ? 'progress_activity' : 'expand_more'}
                                         size={18}
-                                        className={loadingModels ? 'animate-spin' : ''}
+                                        className={loadingModels || refreshingModels ? 'animate-spin' : ''}
                                     />
                                 </button>
                             </div>
@@ -1711,6 +1817,9 @@ export function AdminModels() {
     const canListAvailableModels = hasPermission(
         buildAdminPermissionKey('GET', '/v0/admin/model-mappings/available-models')
     );
+    const canRefreshSupportedModels = hasPermission(
+        buildAdminPermissionKey('POST', '/v0/admin/model-mappings/refresh-supported-models')
+    );
     const canListProviderApiKeys = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/provider-api-keys'));
     const canCreateMapping = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/model-mappings'));
     const canUpdateMapping = hasPermission(buildAdminPermissionKey('PUT', '/v0/admin/model-mappings/:id'));
@@ -1753,6 +1862,7 @@ export function AdminModels() {
     const [editMapping, setEditMapping] = useState<ModelMapping | null>(null);
     const [payloadModalMapping, setPayloadModalMapping] = useState<ModelMapping | null>(null);
     const [toast, setToast] = useState<{ show: boolean; message: string }>({ show: false, message: '' });
+    const [refreshingSupportedModels, setRefreshingSupportedModels] = useState(false);
     const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const fetchData = useCallback(async () => {
@@ -1995,6 +2105,30 @@ export function AdminModels() {
         }, 3000);
     }, []);
 
+    const handleRefreshSupportedModels = useCallback(async (): Promise<boolean> => {
+        if (!canRefreshSupportedModels || refreshingSupportedModels) {
+            return false;
+        }
+        setRefreshingSupportedModels(true);
+        try {
+            const res = await apiFetchAdmin<SupportedModelsRefreshResponse>(
+                '/v0/admin/model-mappings/refresh-supported-models',
+                { method: 'POST' }
+            );
+            if ((res.changed_providers?.length || 0) > 0) {
+                showToast(t('Supported models refreshed'));
+            } else {
+                showToast(t('Supported models are already up to date'));
+            }
+            return true;
+        } catch (err) {
+            console.error('Failed to refresh supported models:', err);
+            return false;
+        } finally {
+            setRefreshingSupportedModels(false);
+        }
+    }, [canRefreshSupportedModels, refreshingSupportedModels, showToast, t]);
+
     useEffect(() => {
         return () => {
             if (toastTimeoutRef.current) {
@@ -2093,18 +2227,34 @@ export function AdminModels() {
             title={t('Model Mappings')}
             subtitle={t('Manage model name mappings and routing')}
         >
-            <div className="space-y-6">
-                {canCreateMapping && (
-                    <div className="flex justify-end">
-                            <button
-                                onClick={() => setCreateModalOpen(true)}
-                                className="flex items-center gap-2 px-4 py-2 text-sm bg-primary hover:bg-blue-600 text-white rounded-lg font-medium transition-colors"
-                            >
-                                <Icon name="add" size={18} />
-                                <span>{t('New')}</span>
-                            </button>
-                        </div>
-                    )}
+                <div className="space-y-6">
+                  {(canCreateMapping || canRefreshSupportedModels) && (
+                      <div className="flex justify-end gap-3">
+                              {canRefreshSupportedModels && (
+                                  <button
+                                      onClick={() => void handleRefreshSupportedModels()}
+                                      disabled={refreshingSupportedModels}
+                                      className="flex items-center gap-2 px-4 py-2 text-sm bg-white dark:bg-surface-dark hover:bg-gray-50 dark:hover:bg-background-dark text-slate-900 dark:text-white rounded-lg font-medium transition-colors border border-gray-200 dark:border-border-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                                  >
+                                      <Icon
+                                          name="refresh"
+                                          size={18}
+                                          className={refreshingSupportedModels ? 'animate-spin' : ''}
+                                      />
+                                      <span>{refreshingSupportedModels ? t('Refreshing...') : t('Refresh')}</span>
+                                  </button>
+                              )}
+                              {canCreateMapping && (
+                              <button
+                                  onClick={() => setCreateModalOpen(true)}
+                                  className="flex items-center gap-2 px-4 py-2 text-sm bg-primary hover:bg-blue-600 text-white rounded-lg font-medium transition-colors"
+                              >
+                                  <Icon name="add" size={18} />
+                                  <span>{t('New')}</span>
+                              </button>
+                              )}
+                          </div>
+                      )}
 
                 <div className="flex flex-col md:flex-row gap-4 justify-between items-center bg-white dark:bg-surface-dark p-3 rounded-xl border border-gray-200 dark:border-border-dark shadow-sm">
                     <div className="flex gap-3 w-full md:w-auto">
@@ -2384,6 +2534,8 @@ export function AdminModels() {
                     onClose={() => setCreateModalOpen(false)}
                     onSuccess={fetchData}
                     canLoadModels={canListAvailableModels}
+                    canRefreshSupportedModels={canRefreshSupportedModels}
+                    onRefreshSupportedModels={handleRefreshSupportedModels}
                     userGroups={userGroups}
                 />
             )}
@@ -2394,6 +2546,8 @@ export function AdminModels() {
                     onClose={() => setEditMapping(null)}
                     onSuccess={handleEditSave}
                     canLoadModels={canListAvailableModels}
+                    canRefreshSupportedModels={canRefreshSupportedModels}
+                    onRefreshSupportedModels={handleRefreshSupportedModels}
                     userGroups={userGroups}
                 />
             )}

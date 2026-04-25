@@ -166,6 +166,7 @@ var definitions = []Definition{
 	newDefinition("POST", "/v0/admin/model-mappings", "Create Model Mapping", "Models"),
 	newDefinition("GET", "/v0/admin/model-mappings", "List Model Mappings", "Models"),
 	newDefinition("GET", "/v0/admin/model-mappings/available-models", "List Available Models", "Models"),
+	newDefinition("POST", "/v0/admin/model-mappings/refresh-supported-models", "Refresh Supported Models", "Models"),
 	newDefinition("GET", "/v0/admin/model-references/price", "Get Model Reference Price", "Models"),
 	newDefinition("GET", "/v0/admin/model-mappings/:id", "Get Model Mapping", "Models"),
 	newDefinition("PUT", "/v0/admin/model-mappings/:id", "Update Model Mapping", "Models"),
@@ -222,6 +223,7 @@ var definitions = []Definition{
 	newDefinition("GET", "/v0/admin/logs/stats", "View Log Stats", "Logs"),
 	newDefinition("GET", "/v0/admin/logs/trend", "View Log Trend", "Logs"),
 	newDefinition("GET", "/v0/admin/logs/models", "View Log Models", "Logs"),
+	newDefinition("GET", "/v0/admin/logs/providers", "View Log Providers", "Logs"),
 	newDefinition("GET", "/v0/admin/logs/projects", "View Log Projects", "Logs"),
 
 	newDefinition("POST", "/v0/admin/settings", "Create Setting", "Settings"),

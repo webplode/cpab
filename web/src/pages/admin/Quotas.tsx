@@ -14,6 +14,23 @@ interface SubscriptionInfo {
     active_until?: unknown;
 }
 
+interface AuthStatusInfo {
+    state?: string;
+    message?: string;
+    detail?: string;
+    checked_at?: string;
+    http_status?: number;
+    needs_relogin?: boolean;
+}
+
+interface OAuthInfo {
+    expires_at?: string;
+    last_refresh?: string;
+    refresh_status?: string;
+    refresh_status_label?: string;
+    has_refresh_token?: boolean;
+}
+
 interface QuotaRecord {
     id: number;
     auth_id: number;
@@ -22,6 +39,8 @@ interface QuotaRecord {
     data: unknown;
     updated_at: string;
     subscription?: SubscriptionInfo;
+    auth_status?: AuthStatusInfo;
+    oauth?: OAuthInfo;
 }
 
 interface QuotaListResponse {
@@ -304,6 +323,13 @@ function normalizePercent(value: number): number {
     return Math.min(100, Math.max(0, normalized));
 }
 
+function clampPercent(value: number): number {
+    if (!Number.isFinite(value)) {
+        return 0;
+    }
+    return Math.min(100, Math.max(0, value));
+}
+
 function extractModelName(item: Record<string, unknown>): string {
     for (const key of modelKeys) {
         const name = toStringValue(item[key]);
@@ -581,12 +607,9 @@ function buildCodexItem(
     locale: string
 ): QuotaItem | null {
     const usedPercentRaw = toNumber(window.used_percent ?? window.usedPercent);
-    let percent: number | null = null;
-    if (limitReached || allowed === false) {
-        percent = 0;
-    } else if (usedPercentRaw !== null) {
-        const used = normalizePercent(usedPercentRaw);
-        percent = Math.max(0, 100 - used);
+    let percent = usedPercentRaw !== null ? clampPercent(usedPercentRaw) : null;
+    if (percent === null && (limitReached || allowed === false)) {
+        percent = 100;
     }
     const resetTime = resolveCodexResetTime(window, locale);
     return {
@@ -653,6 +676,29 @@ function normalizeBoolean(value: unknown): boolean | null {
     return null;
 }
 
+function requiresAuthRelogin(status: AuthStatusInfo | undefined): boolean {
+    if (!status) {
+        return false;
+    }
+    if (status.needs_relogin === true) {
+        return true;
+    }
+    return toStringValue(status.state) === 'needs_relogin';
+}
+
+function getOAuthRefreshStatusClasses(status: string): string {
+    switch (status) {
+        case 'needs_relogin':
+            return 'bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-200';
+        case 'expired':
+            return 'bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-200';
+        case 'active':
+            return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200';
+        default:
+            return 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200';
+    }
+}
+
 function toRecord(value: unknown): Record<string, unknown> | null {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return null;
@@ -670,6 +716,25 @@ function formatQuotaTime(value: string | null, locale: string): string {
     }
     const formatter = new Intl.DateTimeFormat(locale || undefined, {
         month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+    });
+    return formatter.format(date);
+}
+
+function formatMetaDateTime(value: unknown, locale: string): string {
+    const raw = toStringValue(value);
+    if (!raw) {
+        return '';
+    }
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) {
+        return raw;
+    }
+    const formatter = new Intl.DateTimeFormat(locale || undefined, {
+        year: 'numeric',
+        month: 'short',
         day: '2-digit',
         hour: '2-digit',
         minute: '2-digit',
@@ -737,15 +802,15 @@ function getProgressColor(percent: number | null): string {
         return 'bg-gray-300 dark:bg-border-dark';
     }
     if (percent >= 90) {
-        return 'bg-emerald-500';
+        return 'bg-red-500';
     }
     if (percent >= 70) {
-        return 'bg-lime-500';
+        return 'bg-orange-500';
     }
     if (percent >= 50) {
         return 'bg-amber-500';
     }
-    return 'bg-orange-500';
+    return 'bg-emerald-500';
 }
 
 export function AdminQuotas() {
@@ -753,7 +818,7 @@ export function AdminQuotas() {
     const { hasPermission } = useAdminPermissions();
     const canListQuotas = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/quotas'));
     const canListAuthGroups = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/auth-groups'));
-    const pageSize = 12;
+    const pageSize = 10;
 
     const [quotas, setQuotas] = useState<QuotaRecord[]>([]);
     const [types, setTypes] = useState<string[]>([]);
@@ -1007,33 +1072,126 @@ export function AdminQuotas() {
                         {t('No quota data available')}
                     </div>
                 ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                        {quotaCards.map((quota) => (
-                            <div
-                                key={quota.id}
-                                className="bg-white dark:bg-surface-dark rounded-2xl border border-gray-200 dark:border-border-dark shadow-sm p-5 flex flex-col gap-4"
-                            >
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                          {quotaCards.map((quota) => (
+                              <div
+                                  key={quota.id}
+                                  className="bg-white dark:bg-surface-dark rounded-2xl border border-gray-200 dark:border-border-dark shadow-sm p-5 flex flex-col gap-4"
+                              >
                                 <div className="flex items-start gap-3">
                                     <span className="px-3 py-1 rounded-full text-xs font-semibold tracking-wide bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">
                                         {quota.typeLabel}
                                     </span>
-                                    <div className="flex-1 text-base font-semibold text-slate-900 dark:text-white break-all">
-                                        {quota.auth_key}
-                                    </div>
-                                </div>
-                                {quota.subscription?.active_until != null && (() => {
-                                    const expired = isSubscriptionExpired(quota.subscription.active_until);
+                                      <div className="flex-1 text-base font-semibold text-slate-900 dark:text-white break-all">
+                                          {quota.auth_key}
+                                      </div>
+                                  </div>
+                                  {requiresAuthRelogin(quota.auth_status) ? (() => {
+                                      const statusMessage = toStringValue(quota.auth_status?.message)
+                                          || t('Auth token expired, need re-login');
+                                      const statusDetail = toStringValue(quota.auth_status?.detail);
+                                      const checkedAtLabel = formatQuotaTime(
+                                          toStringValue(quota.auth_status?.checked_at),
+                                          i18n.language
+                                      );
+                                      return (
+                                          <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-red-700 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200">
+                                              <div className="flex items-start gap-2">
+                                                  <Icon name="warning_amber" size={18} className="mt-0.5 shrink-0" />
+                                                  <div className="min-w-0 space-y-1">
+                                                      <div className="text-sm font-semibold">
+                                                          {statusMessage}
+                                                      </div>
+                                                      {statusDetail ? (
+                                                          <div className="text-xs break-words opacity-80">
+                                                              {statusDetail}
+                                                          </div>
+                                                      ) : null}
+                                                      {checkedAtLabel ? (
+                                                          <div className="text-[11px] opacity-75">
+                                                              {t('Checked')}: {checkedAtLabel}
+                                                          </div>
+                                                      ) : null}
+                                                  </div>
+                                              </div>
+                                          </div>
+                                      );
+                                  })() : null}
+                                  {quota.oauth ? (() => {
+                                      const refreshStatus = toStringValue(quota.oauth.refresh_status);
+                                      const refreshStatusLabel = toStringValue(quota.oauth.refresh_status_label) || t('Unknown');
+                                      const expiresLabel = formatMetaDateTime(quota.oauth.expires_at, i18n.language) || '--';
+                                      const lastRefreshLabel = formatMetaDateTime(quota.oauth.last_refresh, i18n.language) || '--';
+                                      if (!refreshStatus && expiresLabel === '--' && lastRefreshLabel === '--') {
+                                          return null;
+                                      }
+                                      return (
+                                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 dark:border-border-dark dark:bg-background-dark/60">
+                                              <div className="flex items-center justify-between gap-3">
+                                                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-text-secondary">
+                                                      {t('OAuth')}
+                                                  </div>
+                                                  <span className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ${getOAuthRefreshStatusClasses(refreshStatus)}`}>
+                                                      {refreshStatusLabel}
+                                                  </span>
+                                              </div>
+                                              <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                                                  <div className="rounded-lg bg-white px-2.5 py-2 dark:bg-surface-dark">
+                                                      <div className="text-slate-500 dark:text-text-secondary">{t('Token Expires')}</div>
+                                                      <div className="mt-1 font-semibold text-slate-900 dark:text-white break-words">
+                                                          {expiresLabel}
+                                                      </div>
+                                                  </div>
+                                                  <div className="rounded-lg bg-white px-2.5 py-2 dark:bg-surface-dark">
+                                                      <div className="text-slate-500 dark:text-text-secondary">{t('Last Refresh')}</div>
+                                                      <div className="mt-1 font-semibold text-slate-900 dark:text-white break-words">
+                                                          {lastRefreshLabel}
+                                                      </div>
+                                                  </div>
+                                              </div>
+                                          </div>
+                                      );
+                                  })() : null}
+                                  {quota.subscription && (() => {
+                                      const expired = isSubscriptionExpired(quota.subscription.active_until);
+                                      const startLabel = formatSubscriptionDate(quota.subscription.active_start, i18n.language);
                                     const untilLabel = formatSubscriptionDate(quota.subscription.active_until, i18n.language);
-                                    return untilLabel ? (
-                                        <div className={`flex items-center gap-2 text-xs px-2 py-1.5 rounded-lg ${
+                                    const untilLabelKey = expired ? t('Ended') : t('Renews');
+                                    const rawPlanType = toStringValue(quota.subscription.plan_type);
+                                    const planLabel = rawPlanType
+                                        ? formatTypeLabel(rawPlanType, rawPlanType)
+                                        : '';
+                                    if (!startLabel && !untilLabel && !planLabel) {
+                                        return null;
+                                    }
+                                    return (
+                                        <div className={`flex flex-col gap-1 text-xs px-2 py-1.5 rounded-lg ${
                                             expired
                                                 ? 'bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400'
                                                 : 'bg-blue-50 text-blue-600 dark:bg-blue-900/20 dark:text-blue-400'
                                         }`}>
-                                            <span>{expired ? t('Expired') : t('Subscription')}</span>
-                                            <span className="font-semibold">{untilLabel}</span>
+                                            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                                <span className="font-semibold">
+                                                    {expired ? t('Expired Subscription') : t('Subscription')}
+                                                </span>
+                                                {planLabel ? (
+                                                    <span className="font-semibold">{planLabel}</span>
+                                                ) : null}
+                                            </div>
+                                            <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
+                                                {startLabel ? (
+                                                    <span>
+                                                        {t('Start')}: <span className="font-semibold">{startLabel}</span>
+                                                    </span>
+                                                ) : null}
+                                                {untilLabel ? (
+                                                    <span>
+                                                        {untilLabelKey}: <span className="font-semibold">{untilLabel}</span>
+                                                    </span>
+                                                ) : null}
+                                            </div>
                                         </div>
-                                    ) : null;
+                                    );
                                 })()}
                                 <div className="border-t border-dashed border-gray-200 dark:border-border-dark" />
                                 <AutoScrollList className="flex flex-col gap-4 max-h-72 overflow-y-auto scrollbar-hidden pr-1">

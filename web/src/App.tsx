@@ -25,6 +25,7 @@ import { AdminBills } from './pages/admin/Bills';
 import { AdminBillingRules } from './pages/admin/BillingRules';
 import { AdminPrepaidCards } from './pages/admin/PrepaidCards';
 import { AdminLogs } from './pages/admin/Logs';
+import { AdminUsage } from './pages/admin/Usage';
 import { AdminSettings } from './pages/admin/Settings';
 import { AdminAdministrators } from './pages/admin/Administrators';
 import { AdminLogin } from './pages/admin/Login';
@@ -65,6 +66,7 @@ function App() {
                 <Route path="/admin/bills" element={<AdminBills />} />
                 <Route path="/admin/billing-rules" element={<AdminBillingRules />} />
                 <Route path="/admin/administrators" element={<AdminAdministrators />} />
+                <Route path="/admin/usage" element={<AdminUsage />} />
                 <Route path="/admin/logs" element={<AdminLogs />} />
                 <Route path="/admin/settings" element={<AdminSettings />} />
             </Routes>

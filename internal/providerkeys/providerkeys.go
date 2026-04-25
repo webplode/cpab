@@ -80,6 +80,7 @@ func ApplyToConfig(cfg *sdkconfig.Config, providerRows []models.ProviderAPIKey, 
 				Prefix:   strings.TrimSpace(row.Prefix),
 				BaseURL:  strings.TrimSpace(row.BaseURL),
 				ProxyURL: strings.TrimSpace(row.ProxyURL),
+				AuthMode: sdkconfig.NormalizeClaudeAuthMode(row.AuthMode),
 				Headers:  decodeHeaders(row.Headers),
 			}
 			applyJSON(row.Models, &entry.Models)

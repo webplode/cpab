@@ -83,6 +83,12 @@ export function AdminSidebar({ onChangePassword, onMFA, onLogout }: AdminSidebar
                 permissions: [buildAdminPermissionKey('GET', '/v0/admin/provider-api-keys')],
             },
             {
+                icon: 'insights',
+                label: t('Usage'),
+                href: '/admin/usage',
+                permissions: [buildAdminPermissionKey('GET', '/v0/admin/usage')],
+            },
+            {
                 icon: 'lan',
                 label: t('Proxies'),
                 href: '/admin/proxies',

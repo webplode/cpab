@@ -24,12 +24,9 @@ func NewAdminLogsHandler(db *gorm.DB) *AdminLogsHandler {
 
 // adminLogsListQuery defines filters for the aggregated list view.
 type adminLogsListQuery struct {
-	Page      int    `form:"page,default=1"`   // Page number.
-	Limit     int    `form:"limit,default=20"` // Page size.
-	StartDate string `form:"start_date"`       // Inclusive start date.
-	EndDate   string `form:"end_date"`         // Inclusive end date.
-	Project   string `form:"project"`          // Source/project filter.
-	Model     string `form:"model"`            // Model filter.
+	Page  int `form:"page,default=1"`   // Page number.
+	Limit int `form:"limit,default=20"` // Page size.
+	adminUsageFilterQuery
 }
 
 // adminLogEntry represents a row in the aggregated logs list.
@@ -86,25 +83,13 @@ func (h *AdminLogsHandler) List(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	query := h.db.WithContext(ctx).
-		Model(&models.Usage{})
-
-	if q.StartDate != "" {
-		if startTime, errParse := time.ParseInLocation("2006-01-02", q.StartDate, time.Local); errParse == nil {
-			query = query.Where("requested_at >= ?", startTime)
-		}
-	}
-	if q.EndDate != "" {
-		if endTime, errParse := time.ParseInLocation("2006-01-02", q.EndDate, time.Local); errParse == nil {
-			query = query.Where("requested_at < ?", endTime.AddDate(0, 0, 1))
-		}
-	}
-	if q.Project != "" {
-		query = query.Where("source = ?", q.Project)
-	}
-	if q.Model != "" {
-		query = query.Where("model = ?", q.Model)
-	}
+	query, _ := applyAdminUsageFilters(
+		h.db.WithContext(ctx).Model(&models.Usage{}),
+		q.adminUsageFilterQuery,
+		time.Local,
+		time.Now(),
+	)
+	bucketExpr := adminUsageBucketExpr(h.db, "requested_at", false)
 
 	// dailyAgg captures aggregated log metrics for a date and model.
 	type dailyAgg struct {
@@ -119,43 +104,33 @@ func (h *AdminLogsHandler) List(c *gin.Context) {
 		FailedCount  int64  // Failed request count.
 	}
 
+	groupedQuery := query.Session(&gorm.Session{}).
+		Select(fmt.Sprintf("%s AS bucket, model", bucketExpr)).
+		Group(bucketExpr + ", model")
 	var total int64
-	countQuery := h.db.WithContext(ctx).
-		Model(&models.Usage{})
-	if q.StartDate != "" {
-		if startTime, errParse := time.ParseInLocation("2006-01-02", q.StartDate, time.Local); errParse == nil {
-			countQuery = countQuery.Where("requested_at >= ?", startTime)
-		}
+	if errCount := h.db.WithContext(ctx).
+		Table("(?) AS grouped_logs", groupedQuery).
+		Count(&total).Error; errCount != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "count logs failed"})
+		return
 	}
-	if q.EndDate != "" {
-		if endTime, errParse := time.ParseInLocation("2006-01-02", q.EndDate, time.Local); errParse == nil {
-			countQuery = countQuery.Where("requested_at < ?", endTime.AddDate(0, 0, 1))
-		}
-	}
-	if q.Project != "" {
-		countQuery = countQuery.Where("source = ?", q.Project)
-	}
-	if q.Model != "" {
-		countQuery = countQuery.Where("model = ?", q.Model)
-	}
-	countQuery.Select("COUNT(DISTINCT TO_CHAR(requested_at, 'YYYY-MM-DD') || COALESCE(model, ''))").Scan(&total)
 
 	offset := (q.Page - 1) * q.Limit
 	var aggs []dailyAgg
 	if errAgg := query.
-		Select(`
-			TO_CHAR(requested_at, 'YYYY-MM-DD') AS date,
+		Select(fmt.Sprintf(`
+			%s AS date,
 			model,
-			COALESCE(STRING_AGG(DISTINCT NULLIF(provider, ''), ','), '') AS providers,
+			%s AS providers,
 			COUNT(*) AS requests,
 			COALESCE(SUM(input_tokens), 0) AS input_tokens,
 			COALESCE(SUM(output_tokens), 0) AS output_tokens,
 			COALESCE(SUM(total_tokens), 0) AS total_tokens,
 			COALESCE(SUM(cost_micros), 0) AS cost_micros,
-			SUM(CASE WHEN failed THEN 1 ELSE 0 END) AS failed_count
-		`).
-		Group("TO_CHAR(requested_at, 'YYYY-MM-DD'), model").
-		Order("TO_CHAR(requested_at, 'YYYY-MM-DD') DESC, model").
+			COALESCE(SUM(CASE WHEN failed THEN 1 ELSE 0 END), 0) AS failed_count
+		`, bucketExpr, adminUsageProviderAggExpr(h.db, "provider"))).
+		Group(bucketExpr + ", model").
+		Order(bucketExpr + " DESC, model").
 		Offset(offset).Limit(q.Limit).
 		Scan(&aggs).Error; errAgg != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query logs failed"})
@@ -177,13 +152,8 @@ func (h *AdminLogsHandler) List(c *gin.Context) {
 			}
 		}
 
-		dateFormatted := a.Date
-		if t, errParse := time.Parse("2006-01-02", a.Date); errParse == nil {
-			dateFormatted = t.Format("Jan 02, 2006")
-		}
-
 		logs = append(logs, adminLogEntry{
-			Date:         dateFormatted,
+			Date:         formatAdminUsageBucketLabel(a.Date, false),
 			DateRaw:      a.Date,
 			Project:      "",
 			Model:        a.Model,
@@ -284,11 +254,21 @@ func (h *AdminLogsHandler) Detail(c *gin.Context) {
 
 // Stats returns aggregated KPIs for today vs yesterday.
 func (h *AdminLogsHandler) Stats(c *gin.Context) {
+	var q adminUsageFilterQuery
+	if errBind := c.ShouldBindQuery(&q); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query"})
+		return
+	}
+
 	ctx := c.Request.Context()
 	loc := time.Local
 	now := time.Now().In(loc)
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	yesterdayStart := todayStart.AddDate(0, 0, -1)
+	currentQuery, state := applyAdminUsageFilters(
+		h.db.WithContext(ctx).Model(&models.Usage{}),
+		q,
+		loc,
+		now,
+	)
 
 	// statResult holds aggregated usage stats for a date range.
 	type statResult struct {
@@ -301,25 +281,36 @@ func (h *AdminLogsHandler) Stats(c *gin.Context) {
 
 	var todayStats, yesterdayStats statResult
 
-	h.db.WithContext(ctx).Model(&models.Usage{}).
-		Where("requested_at >= ?", todayStart).
-		Select(`
+	if errToday := currentQuery.Session(&gorm.Session{}).
+		Select(fmt.Sprintf(`
 			COUNT(*) AS requests,
 			COALESCE(SUM(total_tokens), 0) AS total_tokens,
-			SUM(CASE WHEN failed THEN 1 ELSE 0 END) AS failed_count,
+			COALESCE(SUM(CASE WHEN failed THEN 1 ELSE 0 END), 0) AS failed_count,
 			COALESCE(SUM(cost_micros), 0) AS cost_micros,
-			COALESCE(AVG(GREATEST(EXTRACT(EPOCH FROM (created_at - requested_at)) * 1000, 0)), 0) AS avg_request_time_ms
-		`).Scan(&todayStats)
+			%s AS avg_request_time_ms
+		`, adminUsageAvgDurationMsExpr(h.db))).
+		Scan(&todayStats).Error; errToday != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query log stats failed"})
+		return
+	}
 
-	h.db.WithContext(ctx).Model(&models.Usage{}).
-		Where("requested_at >= ? AND requested_at < ?", yesterdayStart, todayStart).
-		Select(`
-			COUNT(*) AS requests,
-			COALESCE(SUM(total_tokens), 0) AS total_tokens,
-			SUM(CASE WHEN failed THEN 1 ELSE 0 END) AS failed_count,
-			COALESCE(SUM(cost_micros), 0) AS cost_micros,
-			COALESCE(AVG(GREATEST(EXTRACT(EPOCH FROM (created_at - requested_at)) * 1000, 0)), 0) AS avg_request_time_ms
-		`).Scan(&yesterdayStats)
+	if prevStart, prevEnd, ok := adminUsagePeriodComparison(state, loc, now); ok {
+		previousQuery := h.db.WithContext(ctx).Model(&models.Usage{})
+		previousQuery, _ = applyAdminUsageFilters(previousQuery, q, loc, now, "range")
+		previousQuery = previousQuery.Where("requested_at >= ? AND requested_at < ?", prevStart, prevEnd)
+		if errYesterday := previousQuery.Session(&gorm.Session{}).
+			Select(fmt.Sprintf(`
+				COUNT(*) AS requests,
+				COALESCE(SUM(total_tokens), 0) AS total_tokens,
+				COALESCE(SUM(CASE WHEN failed THEN 1 ELSE 0 END), 0) AS failed_count,
+				COALESCE(SUM(cost_micros), 0) AS cost_micros,
+				%s AS avg_request_time_ms
+			`, adminUsageAvgDurationMsExpr(h.db))).
+			Scan(&yesterdayStats).Error; errYesterday != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query comparison stats failed"})
+			return
+		}
+	}
 
 	requestsChange := percentChange(todayStats.Requests, yesterdayStats.Requests)
 	tokensChange := percentChange(todayStats.TotalTokens, yesterdayStats.TotalTokens)
@@ -348,11 +339,22 @@ func (h *AdminLogsHandler) Stats(c *gin.Context) {
 
 // Trend returns a seven-day trend of requests and tokens.
 func (h *AdminLogsHandler) Trend(c *gin.Context) {
+	var q adminUsageFilterQuery
+	if errBind := c.ShouldBindQuery(&q); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query"})
+		return
+	}
+
 	ctx := c.Request.Context()
 	loc := time.Local
 	now := time.Now().In(loc)
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	sevenDaysAgo := todayStart.AddDate(0, 0, -6)
+	query, _ := applyAdminUsageFilters(
+		h.db.WithContext(ctx).Model(&models.Usage{}),
+		q,
+		loc,
+		now,
+	)
+	bucketExpr := adminUsageBucketExpr(h.db, "requested_at", false)
 
 	// dailyTrend stores aggregated metrics for a day.
 	type dailyTrend struct {
@@ -361,41 +363,25 @@ func (h *AdminLogsHandler) Trend(c *gin.Context) {
 		TotalTokens int64  // Total tokens.
 	}
 
-	trend := make([]gin.H, 7)
-	for i := 0; i < 7; i++ {
-		day := sevenDaysAgo.AddDate(0, 0, i)
-		trend[i] = gin.H{
-			"day":      day.Format("Mon"),
-			"date":     day.Format("2006-01-02"),
-			"requests": int64(0),
-			"tokens":   int64(0),
-			"active":   i == 6,
-		}
-	}
-
 	var rows []dailyTrend
-	if errFind := h.db.WithContext(ctx).
-		Model(&models.Usage{}).
-		Select(`TO_CHAR(requested_at, 'YYYY-MM-DD') AS date, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS total_tokens`).
-		Where("requested_at >= ?", sevenDaysAgo).
-		Group("TO_CHAR(requested_at, 'YYYY-MM-DD')").
-		Order("TO_CHAR(requested_at, 'YYYY-MM-DD')").
+	if errFind := query.Session(&gorm.Session{}).
+		Select(fmt.Sprintf(`%s AS date, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS total_tokens`, bucketExpr)).
+		Group(bucketExpr).
+		Order(bucketExpr).
 		Scan(&rows).Error; errFind != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query trend failed"})
 		return
 	}
 
-	trendMap := make(map[string]dailyTrend, len(rows))
-	for _, row := range rows {
-		trendMap[row.Date] = row
-	}
-
-	for i, item := range trend {
-		date := item["date"].(string)
-		if row, ok := trendMap[date]; ok {
-			trend[i]["requests"] = row.Requests
-			trend[i]["tokens"] = row.TotalTokens
-		}
+	trend := make([]gin.H, 0, len(rows))
+	for i, row := range rows {
+		trend = append(trend, gin.H{
+			"day":      formatAdminUsageBucketLabel(row.Date, false),
+			"date":     row.Date,
+			"requests": row.Requests,
+			"tokens":   row.TotalTokens,
+			"active":   i == len(rows)-1,
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"trend": trend})
@@ -403,9 +389,23 @@ func (h *AdminLogsHandler) Trend(c *gin.Context) {
 
 // Models returns the distinct model names from usage logs.
 func (h *AdminLogsHandler) Models(c *gin.Context) {
+	var q adminUsageFilterQuery
+	if errBind := c.ShouldBindQuery(&q); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query"})
+		return
+	}
+
 	var modelList []string
-	if errModels := h.db.WithContext(c.Request.Context()).Table("usages").
+	query := applyAdminUsageModelOptions(
+		h.db.WithContext(c.Request.Context()).Table("usages"),
+		q,
+		time.Local,
+		time.Now(),
+	)
+	if errModels := query.
+		Where("model <> ''").
 		Distinct("model").
+		Order("model").
 		Pluck("model", &modelList).Error; errModels != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query models failed"})
 		return
@@ -416,16 +416,57 @@ func (h *AdminLogsHandler) Models(c *gin.Context) {
 
 // Projects returns the distinct project/source names from usage logs.
 func (h *AdminLogsHandler) Projects(c *gin.Context) {
+	var q adminUsageFilterQuery
+	if errBind := c.ShouldBindQuery(&q); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query"})
+		return
+	}
+
 	var projects []string
-	if errProjects := h.db.WithContext(c.Request.Context()).Model(&models.Usage{}).
-		Where("source != ''").
+	query, _ := applyAdminUsageFilters(
+		h.db.WithContext(c.Request.Context()).Model(&models.Usage{}),
+		q,
+		time.Local,
+		time.Now(),
+		"project",
+	)
+	if errProjects := query.
+		Where("source <> ''").
 		Distinct("source").
+		Order("source").
 		Pluck("source", &projects).Error; errProjects != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query projects failed"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"projects": projects})
+}
+
+// Providers returns the distinct provider names from usage logs.
+func (h *AdminLogsHandler) Providers(c *gin.Context) {
+	var q adminUsageFilterQuery
+	if errBind := c.ShouldBindQuery(&q); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query"})
+		return
+	}
+
+	var providers []string
+	query := applyAdminUsageProviderOptions(
+		h.db.WithContext(c.Request.Context()).Model(&models.Usage{}),
+		q,
+		time.Local,
+		time.Now(),
+	)
+	if errProviders := query.
+		Where("provider <> ''").
+		Distinct("provider").
+		Order("provider").
+		Pluck("provider", &providers).Error; errProviders != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query providers failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"providers": providers})
 }
 
 // percentChange computes percentage change between two values.

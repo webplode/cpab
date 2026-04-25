@@ -13,6 +13,8 @@ import (
 	"gorm.io/gorm"
 )
 
+var refreshSupportedModelsCatalog = cliproxy.RefreshGlobalModelCatalog
+
 // ModelMappingHandler manages admin CRUD endpoints for model mappings.
 type ModelMappingHandler struct {
 	db *gorm.DB // Database handle for model mapping records.
@@ -344,4 +346,18 @@ func (h *ModelMappingHandler) AvailableModels(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"models": result})
+}
+
+// RefreshSupportedModels fetches the latest remote model catalog and rebinds supported models.
+func (h *ModelMappingHandler) RefreshSupportedModels(c *gin.Context) {
+	result, err := refreshSupportedModelsCatalog(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":                true,
+		"source":            result.Source,
+		"changed_providers": result.ChangedProviders,
+	})
 }

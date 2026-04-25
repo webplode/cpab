@@ -8,8 +8,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,11 +28,13 @@ const (
 	// from 20s because chatgpt.com/backend-api/wham/usage and the Gemini
 	// quota endpoints occasionally stall past 20s under Cloudflare slow-path
 	// routing; the 3-minute poll interval leaves plenty of headroom.
-	defaultRequestTimeout = 45 * time.Second
-	maxConcurrentRequests = 5
-	noAuthRetryInterval   = 10 * time.Second
-	maxErrorBodyBytes     = 512
-	tokenInvalidatedCode  = "token_invalidated"
+	defaultRequestTimeout  = 45 * time.Second
+	maxConcurrentRequests  = 5
+	noAuthRetryInterval    = 10 * time.Second
+	maxErrorBodyBytes      = 512
+	tokenInvalidatedCode   = "token_invalidated"
+	authStatusHealthy      = "healthy"
+	authStatusNeedsRelogin = "needs_relogin"
 )
 
 const (
@@ -52,10 +52,32 @@ var (
 	codexUsageURL     = "https://chatgpt.com/backend-api/wham/usage"
 )
 
+const (
+	quotaEnvelopePayloadKey    = "_cpab_quota_payload"
+	quotaEnvelopeAuthStatusKey = "_cpab_auth_status"
+	authReloginMessage         = "Auth token expired, need re-login"
+)
+
+// AuthStatus describes the latest quota poll health for an auth entry.
+type AuthStatus struct {
+	State        string    `json:"state,omitempty"`
+	Message      string    `json:"message,omitempty"`
+	Detail       string    `json:"detail,omitempty"`
+	CheckedAt    time.Time `json:"checked_at,omitempty"`
+	HTTPStatus   int       `json:"http_status,omitempty"`
+	NeedsRelogin bool      `json:"needs_relogin,omitempty"`
+}
+
+type quotaEnvelope struct {
+	Payload    json.RawMessage `json:"_cpab_quota_payload,omitempty"`
+	AuthStatus *AuthStatus     `json:"_cpab_auth_status,omitempty"`
+}
+
 type authRowInfo struct {
 	ID          uint64
 	Type        string
 	RuntimeOnly bool
+	IsAvailable bool
 }
 
 // Poller periodically fetches quota data for stored auth entries.
@@ -155,8 +177,11 @@ func (p *Poller) poll(ctx context.Context) time.Duration {
 		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
+		if auth.Disabled {
+			continue
+		}
 		row, ok := rowMap[auth.ID]
-		if !ok || row.RuntimeOnly {
+		if !ok || row.RuntimeOnly || !row.IsAvailable {
 			continue
 		}
 
@@ -212,7 +237,7 @@ func (p *Poller) loadAuthRows(ctx context.Context) (map[string]authRowInfo, erro
 
 	var rows []models.Auth
 	if errFind := p.db.WithContext(ctx).
-		Select("id", "key", "content").
+		Select("id", "key", "content", "is_available").
 		Order("id ASC").
 		Find(&rows).Error; errFind != nil {
 		return nil, errFind
@@ -225,6 +250,7 @@ func (p *Poller) loadAuthRows(ctx context.Context) (map[string]authRowInfo, erro
 			ID:          row.ID,
 			Type:        normalizeString(metadata["type"]),
 			RuntimeOnly: isRuntimeOnly(metadata),
+			IsAvailable: row.IsAvailable,
 		}
 	}
 	return rowMap, nil
@@ -256,25 +282,34 @@ func (p *Poller) pollAntigravity(ctx context.Context, auth *coreauth.Auth, row a
 	headers.Set("User-Agent", antigravityUserAgent)
 	body := []byte("{}")
 
+	var lastStatus int
+	var lastDetail string
+
 	for _, url := range antigravityQuotaURLs {
 		status, payload, errReq := p.doRequest(ctx, auth, http.MethodPost, url, body, headers)
 		if errReq != nil {
 			log.WithError(errReq).Warnf("quota poller: antigravity request failed (auth=%s)", auth.ID)
+			lastStatus = 0
+			lastDetail = errReq.Error()
 			continue
 		}
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
 			if isTokenInvalidatedResponse(status, payload) {
-				p.evictInvalidatedAuth(ctx, auth, row, "antigravity")
+				p.markAuthNeedsRelogin(ctx, auth, row, "antigravity", status, summarizePayload(payload), true)
 				return
 			}
 			log.Warnf("quota poller: antigravity status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
+			lastStatus = status
+			lastDetail = summarizePayload(payload)
 			continue
 		}
-		if errSave := p.saveQuota(ctx, row.ID, row.Type, payload); errSave != nil {
+		if errSave := p.saveQuota(ctx, row.ID, row.Type, payload, healthyAuthStatus(time.Now().UTC())); errSave != nil {
 			log.WithError(errSave).Warnf("quota poller: antigravity save failed (auth=%s)", auth.ID)
 		}
 		return
 	}
+
+	p.markAuthNeedsRelogin(ctx, auth, row, "antigravity", lastStatus, lastDetail, false)
 }
 
 func (p *Poller) pollCodex(ctx context.Context, auth *coreauth.Auth, row authRowInfo) {
@@ -293,17 +328,19 @@ func (p *Poller) pollCodex(ctx context.Context, auth *coreauth.Auth, row authRow
 	status, payload, errReq := p.doRequest(ctx, auth, http.MethodGet, codexUsageURL, nil, headers)
 	if errReq != nil {
 		log.WithError(errReq).Warnf("quota poller: codex request failed (auth=%s)", auth.ID)
+		p.markAuthNeedsRelogin(ctx, auth, row, "codex", 0, errReq.Error(), false)
 		return
 	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
 		if isTokenInvalidatedResponse(status, payload) {
-			p.evictInvalidatedAuth(ctx, auth, row, "codex")
+			p.markAuthNeedsRelogin(ctx, auth, row, "codex", status, summarizePayload(payload), true)
 			return
 		}
 		log.Warnf("quota poller: codex status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
+		p.markAuthNeedsRelogin(ctx, auth, row, "codex", status, summarizePayload(payload), false)
 		return
 	}
-	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload); errSave != nil {
+	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload, healthyAuthStatus(time.Now().UTC())); errSave != nil {
 		log.WithError(errSave).Warnf("quota poller: codex save failed (auth=%s)", auth.ID)
 	}
 }
@@ -327,17 +364,19 @@ func (p *Poller) pollGeminiCLI(ctx context.Context, auth *coreauth.Auth, row aut
 	status, payload, errReq := p.doRequest(ctx, auth, http.MethodPost, geminiCLIQuotaURL, body, headers)
 	if errReq != nil {
 		log.WithError(errReq).Warnf("quota poller: gemini-cli request failed (auth=%s)", auth.ID)
+		p.markAuthNeedsRelogin(ctx, auth, row, "gemini-cli", 0, errReq.Error(), false)
 		return
 	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
 		if isTokenInvalidatedResponse(status, payload) {
-			p.evictInvalidatedAuth(ctx, auth, row, "gemini-cli")
+			p.markAuthNeedsRelogin(ctx, auth, row, "gemini-cli", status, summarizePayload(payload), true)
 			return
 		}
 		log.Warnf("quota poller: gemini-cli status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
+		p.markAuthNeedsRelogin(ctx, auth, row, "gemini-cli", status, summarizePayload(payload), false)
 		return
 	}
-	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload); errSave != nil {
+	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload, healthyAuthStatus(time.Now().UTC())); errSave != nil {
 		log.WithError(errSave).Warnf("quota poller: gemini-cli save failed (auth=%s)", auth.ID)
 	}
 }
@@ -375,7 +414,7 @@ func (p *Poller) doRequest(ctx context.Context, auth *coreauth.Auth, method, tar
 	return resp.StatusCode, payload, nil
 }
 
-func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, payload []byte) error {
+func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, payload []byte, status *AuthStatus) error {
 	if p == nil || p.db == nil {
 		return errors.New("quota poller: db not initialized")
 	}
@@ -392,6 +431,10 @@ func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, 
 	if len(payload) == 0 {
 		return errors.New("quota poller: empty payload")
 	}
+	storedPayload, errStored := marshalStoredQuota(payload, status)
+	if errStored != nil {
+		return errStored
+	}
 
 	now := time.Now().UTC()
 	var existing models.Quota
@@ -403,7 +446,7 @@ func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, 
 			Model(&models.Quota{}).
 			Where("id = ?", existing.ID).
 			Updates(map[string]any{
-				"data":       datatypes.JSON(payload),
+				"data":       datatypes.JSON(storedPayload),
 				"updated_at": now,
 			}).Error
 	}
@@ -411,7 +454,7 @@ func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, 
 		row := models.Quota{
 			AuthID:    authID,
 			Type:      authType,
-			Data:      datatypes.JSON(payload),
+			Data:      datatypes.JSON(storedPayload),
 			CreatedAt: now,
 			UpdatedAt: now,
 		}
@@ -420,8 +463,8 @@ func (p *Poller) saveQuota(ctx context.Context, authID uint64, authType string, 
 	return errFind
 }
 
-func (p *Poller) evictInvalidatedAuth(ctx context.Context, auth *coreauth.Auth, row authRowInfo, provider string) {
-	if p == nil || p.db == nil || p.manager == nil || auth == nil {
+func (p *Poller) markAuthNeedsRelogin(ctx context.Context, auth *coreauth.Auth, row authRowInfo, provider string, httpStatus int, detail string, disableAuth bool) {
+	if p == nil || p.db == nil || auth == nil {
 		return
 	}
 	if ctx == nil {
@@ -429,26 +472,23 @@ func (p *Poller) evictInvalidatedAuth(ctx context.Context, auth *coreauth.Auth, 
 	}
 
 	authID := strings.TrimSpace(auth.ID)
-	if authID == "" {
+	if authID == "" || row.ID == 0 {
 		return
 	}
 
-	p.disableRuntimeAuth(ctx, authID)
-	if errDelete := p.deleteAuthAndQuota(ctx, row, authID); errDelete != nil {
-		log.WithError(errDelete).Warnf("quota poller: failed to delete invalidated auth record (auth=%s provider=%s)", authID, provider)
-		return
+	status := needsReloginAuthStatus(time.Now().UTC(), httpStatus, detail)
+	if errSave := p.saveQuotaStatus(ctx, row.ID, row.Type, status); errSave != nil {
+		log.WithError(errSave).Warnf("quota poller: failed to persist auth status (auth=%s provider=%s)", authID, provider)
 	}
 
-	removedFiles, errRemoveFiles := removeAuthFilesFromDisk(authID, auth)
-	if errRemoveFiles != nil {
-		log.WithError(errRemoveFiles).Warnf("quota poller: failed removing invalidated auth files (auth=%s provider=%s)", authID, provider)
+	if disableAuth {
+		p.disableRuntimeAuth(ctx, authID)
+		if errSet := p.setAuthAvailability(ctx, row.ID, false); errSet != nil {
+			log.WithError(errSet).Warnf("quota poller: failed to mark auth unavailable (auth=%s provider=%s)", authID, provider)
+		}
 	}
 
-	if errLoad := p.manager.Load(coreauth.WithSkipPersist(ctx)); errLoad != nil {
-		log.WithError(errLoad).Warnf("quota poller: failed to refresh auth manager after eviction (auth=%s provider=%s)", authID, provider)
-	}
-
-	log.Warnf("quota poller: evicted invalidated auth (provider=%s auth=%s db_id=%d files_removed=%d)", provider, authID, row.ID, removedFiles)
+	log.Warnf("quota poller: auth requires re-login (provider=%s auth=%s db_id=%d disable=%t status=%d detail=%s)", provider, authID, row.ID, disableAuth, httpStatus, detail)
 }
 
 func (p *Poller) disableRuntimeAuth(ctx context.Context, authID string) {
@@ -474,90 +514,23 @@ func (p *Poller) disableRuntimeAuth(ctx context.Context, authID string) {
 	}
 }
 
-func (p *Poller) deleteAuthAndQuota(ctx context.Context, row authRowInfo, authID string) error {
+func (p *Poller) setAuthAvailability(ctx context.Context, authRowID uint64, isAvailable bool) error {
 	if p == nil || p.db == nil {
 		return errors.New("quota poller: db not initialized")
 	}
-	authID = strings.TrimSpace(authID)
-	if row.ID == 0 && authID == "" {
-		return errors.New("quota poller: missing auth identifier")
+	if authRowID == 0 {
+		return errors.New("quota poller: missing auth row id")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	return p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx.Model(&models.Auth{})
-		if row.ID != 0 {
-			query = query.Where("id = ?", row.ID)
-		} else {
-			query = query.Where("key = ?", authID)
-		}
-		if errDelete := query.Delete(&models.Auth{}).Error; errDelete != nil {
-			return errDelete
-		}
-
-		if row.ID != 0 {
-			if errDeleteQuota := tx.Where("auth_id = ?", row.ID).Delete(&models.Quota{}).Error; errDeleteQuota != nil {
-				return errDeleteQuota
-			}
-		}
-		return nil
-	})
-}
-
-func removeAuthFilesFromDisk(authID string, auth *coreauth.Auth) (int, error) {
-	authID = strings.TrimSpace(authID)
-	if authID == "" {
-		return 0, nil
-	}
-
-	workingDir, errGetwd := os.Getwd()
-	if errGetwd != nil {
-		return 0, errGetwd
-	}
-	baseDir := filepath.Clean(workingDir)
-	if baseDir == "" {
-		return 0, nil
-	}
-
-	candidates := make([]string, 0, 3)
-	if auth != nil {
-		candidates = append(candidates, strings.TrimSpace(auth.Attributes["path"]))
-		candidates = append(candidates, strings.TrimSpace(auth.Attributes["source"]))
-	}
-	if derived := safeJoinAuthPath(baseDir, authID); derived != "" {
-		candidates = append(candidates, derived)
-	}
-
-	removed := 0
-	seen := make(map[string]struct{}, len(candidates))
-	var firstErr error
-	for _, candidate := range candidates {
-		candidate = filepath.Clean(strings.TrimSpace(candidate))
-		if candidate == "" || !filepath.IsAbs(candidate) {
-			continue
-		}
-		if candidate != baseDir && !strings.HasPrefix(candidate, baseDir+string(os.PathSeparator)) {
-			continue
-		}
-		if _, exists := seen[candidate]; exists {
-			continue
-		}
-		seen[candidate] = struct{}{}
-
-		if errRemove := os.Remove(candidate); errRemove != nil {
-			if errors.Is(errRemove, os.ErrNotExist) {
-				continue
-			}
-			if firstErr == nil {
-				firstErr = errRemove
-			}
-			continue
-		}
-		removed++
-	}
-	return removed, firstErr
+	return p.db.WithContext(ctx).
+		Model(&models.Auth{}).
+		Where("id = ?", authRowID).
+		Updates(map[string]any{
+			"is_available": isAvailable,
+			"updated_at":   time.Now().UTC(),
+		}).Error
 }
 
 func isTokenInvalidatedResponse(status int, payload []byte) bool {
@@ -700,27 +673,6 @@ func parseIDTokenPayload(value any) map[string]any {
 	return parsed
 }
 
-func safeJoinAuthPath(baseDir string, name string) string {
-	baseDir = strings.TrimSpace(baseDir)
-	name = strings.TrimSpace(name)
-	if baseDir == "" || name == "" {
-		return ""
-	}
-	if filepath.IsAbs(name) {
-		return ""
-	}
-	cleaned := filepath.Clean(name)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
-		return ""
-	}
-	full := filepath.Clean(filepath.Join(baseDir, cleaned))
-	base := filepath.Clean(baseDir)
-	if full != base && !strings.HasPrefix(full, base+string(os.PathSeparator)) {
-		return ""
-	}
-	return full
-}
-
 func decodeBase64URL(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -855,4 +807,143 @@ func summarizePayload(payload []byte) string {
 		return string(trimmed[:maxErrorBodyBytes]) + "...(truncated)"
 	}
 	return string(trimmed)
+}
+
+func healthyAuthStatus(now time.Time) *AuthStatus {
+	return &AuthStatus{
+		State:        authStatusHealthy,
+		CheckedAt:    now.UTC(),
+		NeedsRelogin: false,
+	}
+}
+
+func needsReloginAuthStatus(now time.Time, httpStatus int, detail string) *AuthStatus {
+	return &AuthStatus{
+		State:        authStatusNeedsRelogin,
+		Message:      authReloginMessage,
+		Detail:       strings.TrimSpace(detail),
+		CheckedAt:    now.UTC(),
+		HTTPStatus:   httpStatus,
+		NeedsRelogin: true,
+	}
+}
+
+func (p *Poller) saveQuotaStatus(ctx context.Context, authID uint64, authType string, status *AuthStatus) error {
+	if p == nil || p.db == nil {
+		return errors.New("quota poller: db not initialized")
+	}
+	if authID == 0 {
+		return errors.New("quota poller: missing auth id")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	authType = strings.TrimSpace(authType)
+	if authType == "" {
+		authType = "unknown"
+	}
+
+	now := time.Now().UTC()
+	var existing models.Quota
+	errFind := p.db.WithContext(ctx).
+		Where("auth_id = ? AND type = ?", authID, authType).
+		First(&existing).Error
+	switch {
+	case errFind == nil:
+		storedPayload, errMarshal := mergeStoredQuotaStatus(existing.Data, status)
+		if errMarshal != nil {
+			return errMarshal
+		}
+		return p.db.WithContext(ctx).
+			Model(&models.Quota{}).
+			Where("id = ?", existing.ID).
+			Updates(map[string]any{
+				"data":       datatypes.JSON(storedPayload),
+				"updated_at": now,
+			}).Error
+	case errors.Is(errFind, gorm.ErrRecordNotFound):
+		storedPayload, errMarshal := marshalStoredQuota(nil, status)
+		if errMarshal != nil {
+			return errMarshal
+		}
+		row := models.Quota{
+			AuthID:    authID,
+			Type:      authType,
+			Data:      datatypes.JSON(storedPayload),
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		return p.db.WithContext(ctx).Create(&row).Error
+	default:
+		return errFind
+	}
+}
+
+// UnwrapStoredQuotaData returns the provider payload stored in quota.data and any
+// CPAB-specific auth status that was attached by the quota poller.
+func UnwrapStoredQuotaData(data datatypes.JSON) (datatypes.JSON, *AuthStatus) {
+	payload, status, ok := unmarshalStoredQuota(data)
+	if !ok {
+		return normalizePayload(data), nil
+	}
+	return datatypes.JSON(normalizePayload(payload)), status
+}
+
+// MarshalStoredQuotaData wraps a provider quota payload with CPAB-specific auth
+// health metadata so it can be stored in models.Quota.Data.
+func MarshalStoredQuotaData(payload []byte, status *AuthStatus) ([]byte, error) {
+	return marshalStoredQuota(payload, status)
+}
+
+func marshalStoredQuota(payload []byte, status *AuthStatus) ([]byte, error) {
+	envelope := quotaEnvelope{
+		Payload:    json.RawMessage(normalizePayload(payload)),
+		AuthStatus: cloneAuthStatus(status),
+	}
+	return json.Marshal(envelope)
+}
+
+func mergeStoredQuotaStatus(existing datatypes.JSON, status *AuthStatus) ([]byte, error) {
+	payload, _, ok := unmarshalStoredQuota(existing)
+	if !ok {
+		payload = normalizePayload(existing)
+	}
+	return marshalStoredQuota(payload, status)
+}
+
+func unmarshalStoredQuota(data []byte) ([]byte, *AuthStatus, bool) {
+	trimmed := bytesTrimSpace(data)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return nil, nil, false
+	}
+	var raw map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(trimmed, &raw); errUnmarshal != nil {
+		return nil, nil, false
+	}
+	payload, hasPayload := raw[quotaEnvelopePayloadKey]
+	statusRaw, hasStatus := raw[quotaEnvelopeAuthStatusKey]
+	if !hasPayload && !hasStatus {
+		return nil, nil, false
+	}
+
+	var status *AuthStatus
+	if len(bytesTrimSpace(statusRaw)) > 0 && string(bytesTrimSpace(statusRaw)) != "null" {
+		var parsed AuthStatus
+		if errUnmarshal := json.Unmarshal(statusRaw, &parsed); errUnmarshal == nil {
+			status = &parsed
+		}
+	}
+	return normalizePayload(payload), status, true
+}
+
+func cloneAuthStatus(status *AuthStatus) *AuthStatus {
+	if status == nil {
+		return nil
+	}
+	cloned := *status
+	if cloned.CheckedAt.IsZero() {
+		cloned.CheckedAt = time.Now().UTC()
+	}
+	return &cloned
 }

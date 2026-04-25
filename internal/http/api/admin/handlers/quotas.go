@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	dbutil "github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
+	quotapkg "github.com/router-for-me/CLIProxyAPIBusiness/internal/quota"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -28,7 +29,7 @@ func NewQuotaHandler(db *gorm.DB) *QuotaHandler {
 // quotaListQuery defines filters for the quota list view.
 type quotaListQuery struct {
 	Page  int    `form:"page,default=1"`   // Page number.
-	Limit int    `form:"limit,default=12"` // Page size.
+	Limit int    `form:"limit,default=10"` // Page size.
 	Key   string `form:"key"`              // Auth key filter.
 	Type  string `form:"type"`             // Auth type filter.
 	Group string `form:"auth_group_id"`    // Auth group filter.
@@ -56,7 +57,7 @@ func (h *QuotaHandler) List(c *gin.Context) {
 		q.Page = 1
 	}
 	if q.Limit < 1 || q.Limit > 100 {
-		q.Limit = 12
+		q.Limit = 10
 	}
 
 	keyQ := strings.TrimSpace(q.Key)
@@ -124,9 +125,9 @@ func (h *QuotaHandler) List(c *gin.Context) {
 
 	out := make([]gin.H, 0, len(rows))
 	for _, row := range rows {
-		payload := row.Data
+		payload, authStatus := quotapkg.UnwrapStoredQuotaData(row.Data)
 		if isAntigravityType(row.Type) {
-			payload = normalizeAntigravityQuota(row.Data)
+			payload = normalizeAntigravityQuota(payload)
 		}
 		entry := gin.H{
 			"id":         row.ID,
@@ -135,6 +136,12 @@ func (h *QuotaHandler) List(c *gin.Context) {
 			"type":       row.Type,
 			"data":       payload,
 			"updated_at": row.UpdatedAt,
+		}
+		if authStatus != nil {
+			entry["auth_status"] = authStatus
+		}
+		if oauth := extractQuotaOAuthInfo(row.AuthContent, authStatus); oauth != nil {
+			entry["oauth"] = oauth
 		}
 		if sub := extractCodexSubscription(row.Type, row.AuthContent); sub != nil {
 			entry["subscription"] = sub
@@ -238,44 +245,410 @@ func normalizeAntigravityQuota(data datatypes.JSON) datatypes.JSON {
 	return datatypes.JSON(updated)
 }
 
+func extractQuotaOAuthInfo(content datatypes.JSON, authStatus *quotapkg.AuthStatus) gin.H {
+	var payload map[string]any
+	if len(content) > 0 {
+		if err := json.Unmarshal(content, &payload); err != nil {
+			payload = nil
+		}
+	}
+
+	candidates := collectAuthMetadataCandidates(payload)
+	expiresAt, expiryTime, hasExpiry := findFirstTimeCandidate(candidates,
+		"expired",
+		"expire",
+		"expires_at",
+		"expiresAt",
+		"expiry",
+		"expires",
+	)
+	lastRefresh, _, hasLastRefresh := findFirstTimeCandidate(candidates,
+		"last_refresh",
+		"lastRefresh",
+		"last_refreshed_at",
+		"lastRefreshedAt",
+	)
+	hasRefreshToken := findFirstStringCandidate(candidates, "refresh_token", "refreshToken") != ""
+	refreshStatus, refreshLabel := deriveOAuthRefreshStatus(authStatus, hasRefreshToken, expiryTime)
+
+	if !hasExpiry && !hasLastRefresh && refreshStatus == "" {
+		return nil
+	}
+
+	out := gin.H{
+		"refresh_status": refreshStatus,
+	}
+	if refreshLabel != "" {
+		out["refresh_status_label"] = refreshLabel
+	}
+	if hasExpiry && expiresAt != "" {
+		out["expires_at"] = expiresAt
+	}
+	if hasLastRefresh && lastRefresh != "" {
+		out["last_refresh"] = lastRefresh
+	}
+	if hasRefreshToken {
+		out["has_refresh_token"] = true
+	}
+	return out
+}
+
+func collectAuthMetadataCandidates(payload map[string]any) []map[string]any {
+	candidates := make([]map[string]any, 0, 12)
+	appendMapCandidate(&candidates, payload)
+	appendAuthMetadataNestedCandidates(&candidates, payload)
+	return candidates
+}
+
+func appendAuthMetadataNestedCandidates(candidates *[]map[string]any, source map[string]any) {
+	if source == nil {
+		return
+	}
+	for _, key := range []string{"metadata", "attributes", "details", "token", "Token", "tokens", "oauth", "auth"} {
+		appendMapCandidate(candidates, mapFromAny(source[key]))
+	}
+	for _, key := range []string{"metadata", "attributes", "details"} {
+		nested := mapFromAny(source[key])
+		if nested == nil {
+			continue
+		}
+		for _, childKey := range []string{"token", "Token", "tokens", "oauth", "auth"} {
+			appendMapCandidate(candidates, mapFromAny(nested[childKey]))
+		}
+	}
+}
+
+func findFirstStringCandidate(candidates []map[string]any, keys ...string) string {
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		for _, key := range keys {
+			if value := scalarString(candidate[key]); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func findFirstTimeCandidate(candidates []map[string]any, keys ...string) (string, time.Time, bool) {
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		for _, key := range keys {
+			raw, ok := candidate[key]
+			if !ok || raw == nil {
+				continue
+			}
+			if ts, okParse := parseTimeCandidate(raw); okParse {
+				ts = ts.UTC()
+				return ts.Format(time.RFC3339), ts, true
+			}
+			if value := scalarString(raw); value != "" {
+				return value, time.Time{}, true
+			}
+		}
+	}
+	return "", time.Time{}, false
+}
+
+func deriveOAuthRefreshStatus(authStatus *quotapkg.AuthStatus, hasRefreshToken bool, expiry time.Time) (string, string) {
+	if authStatus != nil {
+		if authStatus.NeedsRelogin || strings.EqualFold(strings.TrimSpace(authStatus.State), "needs_relogin") {
+			return "needs_relogin", "Needs re-login"
+		}
+	}
+	if !expiry.IsZero() && expiry.Before(time.Now().UTC()) {
+		return "expired", "Expired"
+	}
+	if hasRefreshToken {
+		return "active", "Active"
+	}
+	return "unknown", "Unknown"
+}
+
+func parseTimeCandidate(value any) (time.Time, bool) {
+	switch typed := value.(type) {
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" {
+			return time.Time{}, false
+		}
+		for _, layout := range []string{
+			time.RFC3339,
+			time.RFC3339Nano,
+			"2006-01-02 15:04:05",
+			"2006-01-02 15:04",
+		} {
+			if ts, err := time.Parse(layout, text); err == nil {
+				return ts, true
+			}
+		}
+		if unix, err := strconv.ParseInt(text, 10, 64); err == nil {
+			return normalizeUnixTimestamp(unix), true
+		}
+	case float64:
+		return normalizeUnixTimestamp(int64(typed)), true
+	case float32:
+		return normalizeUnixTimestamp(int64(typed)), true
+	case int:
+		return normalizeUnixTimestamp(int64(typed)), true
+	case int64:
+		return normalizeUnixTimestamp(typed), true
+	case int32:
+		return normalizeUnixTimestamp(int64(typed)), true
+	case uint64:
+		return normalizeUnixTimestamp(int64(typed)), true
+	case uint32:
+		return normalizeUnixTimestamp(int64(typed)), true
+	case json.Number:
+		if unix, err := typed.Int64(); err == nil {
+			return normalizeUnixTimestamp(unix), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func normalizeUnixTimestamp(raw int64) time.Time {
+	if raw > 1_000_000_000_000 {
+		return time.UnixMilli(raw)
+	}
+	return time.Unix(raw, 0)
+}
+
+func scalarString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	case float64:
+		return strings.TrimSpace(strconv.FormatFloat(typed, 'f', -1, 64))
+	case float32:
+		return strings.TrimSpace(strconv.FormatFloat(float64(typed), 'f', -1, 64))
+	case int:
+		return strconv.Itoa(typed)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case int32:
+		return strconv.FormatInt(int64(typed), 10)
+	case uint64:
+		return strconv.FormatUint(typed, 10)
+	case uint32:
+		return strconv.FormatUint(uint64(typed), 10)
+	default:
+		return ""
+	}
+}
+
 // extractCodexSubscription extracts subscription start/until dates from a codex
 // auth's content JSON by decoding the embedded id_token JWT payload.
 func extractCodexSubscription(authType string, content datatypes.JSON) gin.H {
 	if !strings.Contains(strings.ToLower(authType), "codex") || len(content) == 0 {
 		return nil
 	}
-	var parsed struct {
-		Metadata map[string]any `json:"metadata"`
-	}
-	if err := json.Unmarshal(content, &parsed); err != nil || parsed.Metadata == nil {
-		return nil
-	}
-	idToken, _ := parsed.Metadata["id_token"].(string)
-	if idToken == "" {
-		return nil
-	}
-	claims := decodeJWTPayload(idToken)
-	if claims == nil {
-		return nil
-	}
-	auth, _ := claims["https://api.openai.com/auth"].(map[string]any)
-	if auth == nil {
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil {
 		return nil
 	}
 	result := gin.H{}
-	if v := auth["chatgpt_plan_type"]; v != nil {
-		result["plan_type"] = v
-	}
-	if v := auth["chatgpt_subscription_active_start"]; v != nil {
-		result["active_start"] = v
-	}
-	if v := auth["chatgpt_subscription_active_until"]; v != nil {
-		result["active_until"] = v
+	for _, candidate := range collectCodexSubscriptionCandidates(payload) {
+		assignFirstSubscriptionValue(result, "plan_type", candidate, []string{
+			"chatgpt_plan_type",
+			"plan_type",
+			"planType",
+			"subscription_plan_type",
+			"subscriptionPlanType",
+			"subscription_type",
+			"subscriptionType",
+			"plan",
+			"tier",
+		})
+		assignFirstSubscriptionValue(result, "active_start", candidate, []string{
+			"chatgpt_subscription_active_start",
+			"subscription_active_start",
+			"subscription_start",
+			"subscriptionStart",
+			"active_start",
+			"activeStart",
+			"current_period_start",
+			"currentPeriodStart",
+			"period_start",
+			"periodStart",
+			"start_date",
+			"startDate",
+		})
+		assignFirstSubscriptionValue(result, "active_until", candidate, []string{
+			"chatgpt_subscription_active_until",
+			"subscription_active_until",
+			"subscription_end",
+			"subscriptionEnd",
+			"active_until",
+			"activeUntil",
+			"renewal_date",
+			"renewalDate",
+			"next_renewal_date",
+			"nextRenewalDate",
+			"current_period_end",
+			"currentPeriodEnd",
+			"period_end",
+			"periodEnd",
+			"end_date",
+			"endDate",
+			"expires_at",
+			"expiresAt",
+			"expiration_date",
+			"expirationDate",
+			"expires",
+		})
+		if result["plan_type"] != nil && result["active_start"] != nil && result["active_until"] != nil {
+			break
+		}
 	}
 	if len(result) == 0 {
 		return nil
 	}
 	return result
+}
+
+func collectCodexSubscriptionCandidates(payload map[string]any) []map[string]any {
+	candidates := make([]map[string]any, 0, 16)
+	appendMapCandidate(&candidates, payload)
+	appendNestedSubscriptionCandidates(&candidates, payload)
+	if claims := extractCodexJWTClaims(payload); claims != nil {
+		appendMapCandidate(&candidates, claims)
+		authClaims := mapFromAny(claims["https://api.openai.com/auth"])
+		appendMapCandidate(&candidates, authClaims)
+		appendNestedSubscriptionCandidates(&candidates, claims)
+		appendNestedSubscriptionCandidates(&candidates, authClaims)
+	}
+	return candidates
+}
+
+func appendNestedSubscriptionCandidates(candidates *[]map[string]any, source map[string]any) {
+	if source == nil {
+		return
+	}
+	containerKeys := []string{
+		"subscription",
+		"billing",
+		"membership",
+		"account",
+		"plan",
+		"profile",
+		"user",
+	}
+	for _, key := range containerKeys {
+		appendMapCandidate(candidates, mapFromAny(source[key]))
+	}
+	for _, key := range []string{"metadata", "attributes", "details"} {
+		nested := mapFromAny(source[key])
+		appendMapCandidate(candidates, nested)
+		for _, containerKey := range containerKeys {
+			appendMapCandidate(candidates, mapFromAny(nested[containerKey]))
+		}
+	}
+}
+
+func appendMapCandidate(candidates *[]map[string]any, candidate map[string]any) {
+	if candidate == nil {
+		return
+	}
+	*candidates = append(*candidates, candidate)
+}
+
+func assignFirstSubscriptionValue(result gin.H, field string, candidate map[string]any, keys []string) {
+	if candidate == nil || result[field] != nil {
+		return
+	}
+	if value := firstValueForKeys(candidate, keys); value != nil {
+		result[field] = value
+	}
+}
+
+func firstValueForKeys(candidate map[string]any, keys []string) any {
+	if candidate == nil {
+		return nil
+	}
+	for _, key := range keys {
+		value, ok := candidate[key]
+		if !ok || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			if strings.TrimSpace(typed) == "" {
+				continue
+			}
+		case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, bool:
+		default:
+			continue
+		}
+		return value
+	}
+	return nil
+}
+
+func extractCodexJWTClaims(payload map[string]any) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	candidates := []any{
+		payload["id_token"],
+		payload["idToken"],
+		payload["jwt"],
+		payload["claims"],
+		mapValue(payload, "metadata", "id_token"),
+		mapValue(payload, "metadata", "idToken"),
+		mapValue(payload, "metadata", "jwt"),
+		mapValue(payload, "metadata", "claims"),
+		mapValue(payload, "attributes", "id_token"),
+		mapValue(payload, "attributes", "idToken"),
+		mapValue(payload, "attributes", "jwt"),
+		mapValue(payload, "attributes", "claims"),
+		mapValue(payload, "tokens", "id_token"),
+		mapValue(payload, "tokens", "idToken"),
+		mapValue(payload, "oauth", "id_token"),
+		mapValue(payload, "oauth", "idToken"),
+		mapValue(payload, "auth", "id_token"),
+		mapValue(payload, "auth", "idToken"),
+	}
+	for _, candidate := range candidates {
+		if claims := decodeJWTValue(candidate); claims != nil {
+			return claims
+		}
+	}
+	return nil
+}
+
+func mapValue(payload map[string]any, mapKey, valueKey string) any {
+	nested := mapFromAny(payload[mapKey])
+	if nested == nil {
+		return nil
+	}
+	return nested[valueKey]
+}
+
+func mapFromAny(value any) map[string]any {
+	typed, _ := value.(map[string]any)
+	return typed
+}
+
+func decodeJWTValue(value any) map[string]any {
+	switch typed := value.(type) {
+	case string:
+		token := strings.TrimSpace(typed)
+		if token == "" {
+			return nil
+		}
+		return decodeJWTPayload(token)
+	case map[string]any:
+		return typed
+	default:
+		return nil
+	}
 }
 
 // decodeJWTPayload extracts the payload section of a JWT as a map without

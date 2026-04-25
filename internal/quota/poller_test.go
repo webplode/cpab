@@ -2,9 +2,7 @@ package quota
 
 import (
 	"context"
-	"errors"
-	"os"
-	"path/filepath"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -34,7 +32,7 @@ func TestIsTokenInvalidatedResponse(t *testing.T) {
 	}
 }
 
-func TestEvictInvalidatedAuthDeletesRecordAndFile(t *testing.T) {
+func TestMarkAuthNeedsReloginKeepsQuotaAndDisablesAuth(t *testing.T) {
 	db, errOpen := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
 	if errOpen != nil {
 		t.Fatalf("open sqlite: %v", errOpen)
@@ -72,24 +70,7 @@ func TestEvictInvalidatedAuthDeletesRecordAndFile(t *testing.T) {
 		t.Fatalf("load auth manager: %v", errLoad)
 	}
 	if _, ok := manager.GetByID(authID); !ok {
-		t.Fatalf("expected auth %s to exist in manager before eviction", authID)
-	}
-
-	tempDir := t.TempDir()
-	previousWD, errGetwd := os.Getwd()
-	if errGetwd != nil {
-		t.Fatalf("getwd: %v", errGetwd)
-	}
-	if errChdir := os.Chdir(tempDir); errChdir != nil {
-		t.Fatalf("chdir temp dir: %v", errChdir)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(previousWD)
-	})
-
-	authFilePath := filepath.Join(tempDir, authID)
-	if errWrite := os.WriteFile(authFilePath, []byte(`{"token":"x"}`), 0o600); errWrite != nil {
-		t.Fatalf("write auth file: %v", errWrite)
+		t.Fatalf("expected auth %s to exist in manager before relogin mark", authID)
 	}
 
 	poller := NewPoller(db, manager)
@@ -97,32 +78,85 @@ func TestEvictInvalidatedAuthDeletesRecordAndFile(t *testing.T) {
 		t.Fatalf("expected poller to be initialized")
 	}
 
-	poller.evictInvalidatedAuth(context.Background(), &coreauth.Auth{
-		ID:       authID,
-		Provider: "codex",
-		Attributes: map[string]string{
-			"path": authFilePath,
+	poller.markAuthNeedsRelogin(
+		context.Background(),
+		&coreauth.Auth{
+			ID:       authID,
+			Provider: "codex",
 		},
-	}, authRowInfo{ID: authRow.ID, Type: "codex"}, "codex")
+		authRowInfo{ID: authRow.ID, Type: "codex", IsAvailable: true},
+		"codex",
+		401,
+		`{"error":{"code":"token_invalidated"}}`,
+		true,
+	)
 
-	var remainingAuth models.Auth
-	errFindAuth := db.Where("id = ?", authRow.ID).First(&remainingAuth).Error
-	if !errors.Is(errFindAuth, gorm.ErrRecordNotFound) {
-		t.Fatalf("expected auth row to be deleted, got err=%v", errFindAuth)
+	var updatedAuth models.Auth
+	if errFindAuth := db.Where("id = ?", authRow.ID).First(&updatedAuth).Error; errFindAuth != nil {
+		t.Fatalf("expected auth row to remain, got err=%v", errFindAuth)
+	}
+	if updatedAuth.IsAvailable {
+		t.Fatalf("expected auth row to be marked unavailable")
 	}
 
-	var remainingQuota int64
-	if errCount := db.Model(&models.Quota{}).Where("auth_id = ?", authRow.ID).Count(&remainingQuota).Error; errCount != nil {
-		t.Fatalf("count quota rows: %v", errCount)
-	}
-	if remainingQuota != 0 {
-		t.Fatalf("expected quota rows to be deleted, got %d", remainingQuota)
+	var updatedQuota models.Quota
+	if errFindQuota := db.Where("auth_id = ?", authRow.ID).First(&updatedQuota).Error; errFindQuota != nil {
+		t.Fatalf("expected quota row to remain, got err=%v", errFindQuota)
 	}
 
-	if _, ok := manager.GetByID(authID); ok {
-		t.Fatalf("expected auth %s to be removed from manager after refresh", authID)
+	payload, status := UnwrapStoredQuotaData(updatedQuota.Data)
+	if string(payload) != `{"ok":true}` {
+		t.Fatalf("payload = %s, want %s", string(payload), `{"ok":true}`)
 	}
-	if _, errStat := os.Stat(authFilePath); !errors.Is(errStat, os.ErrNotExist) {
-		t.Fatalf("expected auth file to be removed, stat err=%v", errStat)
+	if status == nil {
+		t.Fatalf("expected auth status to be present")
+	}
+	if !status.NeedsRelogin {
+		t.Fatalf("expected needs_relogin to be true")
+	}
+	if status.Message != authReloginMessage {
+		t.Fatalf("message = %q, want %q", status.Message, authReloginMessage)
+	}
+	if status.HTTPStatus != 401 {
+		t.Fatalf("http_status = %d, want 401", status.HTTPStatus)
+	}
+
+	disabledAuth, ok := manager.GetByID(authID)
+	if !ok || disabledAuth == nil {
+		t.Fatalf("expected auth %s to remain in manager", authID)
+	}
+	if !disabledAuth.Disabled {
+		t.Fatalf("expected auth %s to be disabled in manager", authID)
+	}
+}
+
+func TestUnwrapStoredQuotaDataReturnsLegacyPayload(t *testing.T) {
+	payload := datatypes.JSON([]byte(`{"remaining":42}`))
+
+	gotPayload, gotStatus := UnwrapStoredQuotaData(payload)
+	if gotStatus != nil {
+		t.Fatalf("expected legacy payload to have no auth status")
+	}
+	if string(gotPayload) != string(payload) {
+		t.Fatalf("payload = %s, want %s", string(gotPayload), string(payload))
+	}
+}
+
+func TestMarshalStoredQuotaIncludesAuthStatus(t *testing.T) {
+	now := time.Date(2026, time.April, 24, 10, 30, 0, 0, time.UTC)
+	stored, errMarshal := marshalStoredQuota([]byte(`{"used":10}`), needsReloginAuthStatus(now, 500, "gateway timeout"))
+	if errMarshal != nil {
+		t.Fatalf("marshalStoredQuota: %v", errMarshal)
+	}
+
+	var decoded map[string]any
+	if errUnmarshal := json.Unmarshal(stored, &decoded); errUnmarshal != nil {
+		t.Fatalf("unmarshal stored payload: %v", errUnmarshal)
+	}
+	if decoded[quotaEnvelopePayloadKey] == nil {
+		t.Fatalf("expected %s to be present", quotaEnvelopePayloadKey)
+	}
+	if decoded[quotaEnvelopeAuthStatusKey] == nil {
+		t.Fatalf("expected %s to be present", quotaEnvelopeAuthStatusKey)
 	}
 }
