@@ -2,8 +2,69 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
+
+type refreshReuseTestStore struct {
+	items       []*Auth
+	saveCount   atomic.Int32
+	deleteCount atomic.Int32
+}
+
+func (s *refreshReuseTestStore) List(context.Context) ([]*Auth, error) {
+	if len(s.items) == 0 {
+		return nil, nil
+	}
+	out := make([]*Auth, 0, len(s.items))
+	for _, item := range s.items {
+		out = append(out, item.Clone())
+	}
+	return out, nil
+}
+
+func (s *refreshReuseTestStore) Save(context.Context, *Auth) (string, error) {
+	s.saveCount.Add(1)
+	return "", nil
+}
+
+func (s *refreshReuseTestStore) Delete(context.Context, string) error {
+	s.deleteCount.Add(1)
+	return nil
+}
+
+type refreshReuseTestExecutor struct {
+	provider string
+	err      error
+}
+
+func (e refreshReuseTestExecutor) Identifier() string { return e.provider }
+
+func (e refreshReuseTestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e refreshReuseTestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e refreshReuseTestExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
+	return nil, e.err
+}
+
+func (e refreshReuseTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e refreshReuseTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
 
 func TestManager_Update_PreservesModelStates(t *testing.T) {
 	m := NewManager(nil, nil, nil)
@@ -200,5 +261,134 @@ func TestManager_Update_ActiveInheritsModelStates(t *testing.T) {
 	}
 	if state.Quota.BackoffLevel != backoffLevel {
 		t.Fatalf("expected BackoffLevel to be %d, got %d", backoffLevel, state.Quota.BackoffLevel)
+	}
+}
+
+func TestManager_RefreshAuth_RecoversFromStoredRotatedRefreshToken(t *testing.T) {
+	lastRefresh := time.Date(2026, time.April, 24, 10, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	store := &refreshReuseTestStore{
+		items: []*Auth{
+			{
+				ID:       "auth-codex",
+				Provider: "codex",
+				Metadata: map[string]any{
+					"type":          "codex",
+					"refresh_token": "new-refresh",
+					"access_token":  "new-access",
+					"id_token":      "new-id",
+					"last_refresh":  lastRefresh,
+					"expired":       time.Date(2026, time.April, 24, 11, 0, 0, 0, time.UTC).Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	m := NewManager(store, nil, nil)
+	m.RegisterExecutor(refreshReuseTestExecutor{
+		provider: "codex",
+		err:      errors.New(`token refresh failed with status 401: {"error":{"code":"refresh_token_reused"}}`),
+	})
+
+	if _, err := m.Register(WithSkipPersist(context.Background()), &Auth{
+		ID:       "auth-codex",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":          "codex",
+			"refresh_token": "old-refresh",
+			"access_token":  "old-access",
+			"id_token":      "old-id",
+			"last_refresh":  time.Date(2026, time.April, 24, 9, 0, 0, 0, time.UTC).Format(time.RFC3339),
+			"expired":       time.Date(2026, time.April, 24, 9, 30, 0, 0, time.UTC).Format(time.RFC3339),
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	m.refreshAuth(context.Background(), "auth-codex")
+
+	updated, ok := m.GetByID("auth-codex")
+	if !ok || updated == nil {
+		t.Fatal("expected refreshed auth to exist")
+	}
+	if got := updated.Metadata["refresh_token"]; got != "new-refresh" {
+		t.Fatalf("refresh_token = %v, want new-refresh", got)
+	}
+	if got := updated.Metadata["access_token"]; got != "new-access" {
+		t.Fatalf("access_token = %v, want new-access", got)
+	}
+	if got := updated.Metadata["id_token"]; got != "new-id" {
+		t.Fatalf("id_token = %v, want new-id", got)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("LastError = %v, want nil", updated.LastError)
+	}
+	if updated.LastRefreshedAt.IsZero() {
+		t.Fatal("expected LastRefreshedAt to be populated from persisted auth")
+	}
+	if updated.NextRefreshAfter.IsZero() == false {
+		t.Fatalf("NextRefreshAfter = %v, want zero", updated.NextRefreshAfter)
+	}
+	if got := store.saveCount.Load(); got != 0 {
+		t.Fatalf("Save() calls = %d, want 0", got)
+	}
+}
+
+func TestManager_RefreshAuth_ReusedRefreshTokenWithoutStoredUpdateKeepsError(t *testing.T) {
+	store := &refreshReuseTestStore{
+		items: []*Auth{
+			{
+				ID:       "auth-codex",
+				Provider: "codex",
+				Metadata: map[string]any{
+					"type":          "codex",
+					"refresh_token": "old-refresh",
+					"access_token":  "old-access",
+					"id_token":      "old-id",
+					"last_refresh":  time.Date(2026, time.April, 24, 9, 0, 0, 0, time.UTC).Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	m := NewManager(store, nil, nil)
+	m.RegisterExecutor(refreshReuseTestExecutor{
+		provider: "codex",
+		err:      errors.New(`token refresh failed with status 401: {"error":{"code":"refresh_token_reused"}}`),
+	})
+
+	if _, err := m.Register(WithSkipPersist(context.Background()), &Auth{
+		ID:       "auth-codex",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":          "codex",
+			"refresh_token": "old-refresh",
+			"access_token":  "old-access",
+			"id_token":      "old-id",
+			"last_refresh":  time.Date(2026, time.April, 24, 9, 0, 0, 0, time.UTC).Format(time.RFC3339),
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	m.refreshAuth(context.Background(), "auth-codex")
+
+	updated, ok := m.GetByID("auth-codex")
+	if !ok || updated == nil {
+		t.Fatal("expected refreshed auth to exist")
+	}
+	if updated.LastError == nil {
+		t.Fatal("expected LastError to be set when no newer stored token exists")
+	}
+	if !strings.Contains(strings.ToLower(updated.LastError.Message), "refresh_token_reused") {
+		t.Fatalf("LastError = %q, want refresh_token_reused", updated.LastError.Message)
+	}
+	if got := updated.Metadata["refresh_token"]; got != "old-refresh" {
+		t.Fatalf("refresh_token = %v, want old-refresh", got)
+	}
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("expected NextRefreshAfter backoff on unrecovered refresh failure")
+	}
+	if got := store.saveCount.Load(); got != 0 {
+		t.Fatalf("Save() calls = %d, want 0", got)
 	}
 }

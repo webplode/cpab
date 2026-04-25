@@ -35,6 +35,7 @@ type modelStore struct {
 var modelsCatalogStore = &modelStore{}
 
 var updaterOnce sync.Once
+var refreshNowMu sync.Mutex
 
 // ModelRefreshCallback is invoked when startup or periodic model refresh detects changes.
 // changedProviders contains the provider names whose model definitions changed.
@@ -113,21 +114,11 @@ func tryStartupRefresh(ctx context.Context) {
 }
 
 func tryRefreshModels(ctx context.Context, label string) {
-	oldData := getModels()
-
-	parsed, url := fetchModelsFromRemote(ctx)
-	if parsed == nil {
+	changed, url, err := refreshModelsFromRemote(ctx)
+	if err != nil {
 		log.Warnf("%s: fetch failed from all URLs, keeping current data", label)
 		return
 	}
-
-	// Detect changes before updating store.
-	changed := detectChangedProviders(oldData, parsed)
-
-	// Update store with new data regardless.
-	modelsCatalogStore.mu.Lock()
-	modelsCatalogStore.data = parsed
-	modelsCatalogStore.mu.Unlock()
 
 	if len(changed) == 0 {
 		log.Infof("%s completed from %s, no changes detected", label, url)
@@ -136,6 +127,44 @@ func tryRefreshModels(ctx context.Context, label string) {
 
 	log.Infof("%s completed from %s, changes detected for providers: %v", label, url, changed)
 	notifyModelRefresh(changed)
+}
+
+// RefreshModelsNow fetches the latest remote model catalog immediately and
+// updates the in-memory catalog. When provider changes are detected, the
+// registered model refresh callback is invoked just like startup/periodic
+// refreshes.
+func RefreshModelsNow(ctx context.Context) ([]string, string, error) {
+	refreshNowMu.Lock()
+	defer refreshNowMu.Unlock()
+
+	changed, url, err := refreshModelsFromRemote(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(changed) == 0 {
+		log.Infof("manual model refresh completed from %s, no changes detected", url)
+		return nil, url, nil
+	}
+	log.Infof("manual model refresh completed from %s, changes detected for providers: %v", url, changed)
+	notifyModelRefresh(changed)
+	return changed, url, nil
+}
+
+func refreshModelsFromRemote(ctx context.Context) ([]string, string, error) {
+	oldData := getModels()
+
+	parsed, url := fetchModelsFromRemote(ctx)
+	if parsed == nil {
+		return nil, "", fmt.Errorf("fetch failed from all URLs")
+	}
+
+	changed := detectChangedProviders(oldData, parsed)
+
+	modelsCatalogStore.mu.Lock()
+	modelsCatalogStore.data = parsed
+	modelsCatalogStore.mu.Unlock()
+
+	return changed, url, nil
 }
 
 // fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog
@@ -213,8 +242,6 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"codex", oldData.CodexTeam, newData.CodexTeam},
 		{"codex", oldData.CodexPlus, newData.CodexPlus},
 		{"codex", oldData.CodexPro, newData.CodexPro},
-		{"qwen", oldData.Qwen, newData.Qwen},
-		{"iflow", oldData.IFlow, newData.IFlow},
 		{"kimi", oldData.Kimi, newData.Kimi},
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
 	}
@@ -335,8 +362,6 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "codex-team", models: data.CodexTeam},
 		{name: "codex-plus", models: data.CodexPlus},
 		{name: "codex-pro", models: data.CodexPro},
-		{name: "qwen", models: data.Qwen},
-		{name: "iflow", models: data.IFlow},
 		{name: "kimi", models: data.Kimi},
 		{name: "antigravity", models: data.Antigravity},
 	}

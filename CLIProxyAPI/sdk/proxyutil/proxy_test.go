@@ -1,8 +1,14 @@
 package proxyutil
 
 import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func mustDefaultTransport(t *testing.T) *http.Transport {
@@ -157,5 +163,157 @@ func TestBuildHTTPTransportSOCKS5HProxy(t *testing.T) {
 	}
 	if transport.DialContext == nil {
 		t.Fatal("expected SOCKS5H transport to have custom DialContext")
+	}
+}
+
+func TestBuildDialerHTTPProxyCreatesConnectTunnel(t *testing.T) {
+	t.Parallel()
+
+	targetListener, errTarget := net.Listen("tcp", "127.0.0.1:0")
+	if errTarget != nil {
+		t.Fatalf("target listen failed: %v", errTarget)
+	}
+	defer targetListener.Close()
+
+	targetReceived := make(chan string, 1)
+	targetErr := make(chan error, 1)
+	go func() {
+		conn, errAccept := targetListener.Accept()
+		if errAccept != nil {
+			targetErr <- errAccept
+			return
+		}
+		defer conn.Close()
+
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		buf := make([]byte, 4)
+		if _, errRead := io.ReadFull(conn, buf); errRead != nil {
+			targetErr <- errRead
+			return
+		}
+		targetReceived <- string(buf)
+
+		if _, errWrite := conn.Write([]byte("pong")); errWrite != nil {
+			targetErr <- errWrite
+			return
+		}
+		targetErr <- nil
+	}()
+
+	proxyListener, errProxy := net.Listen("tcp", "127.0.0.1:0")
+	if errProxy != nil {
+		t.Fatalf("proxy listen failed: %v", errProxy)
+	}
+	defer proxyListener.Close()
+
+	proxyConnectHost := make(chan string, 1)
+	proxyAuthHeader := make(chan string, 1)
+	proxyErr := make(chan error, 1)
+	go func() {
+		conn, errAccept := proxyListener.Accept()
+		if errAccept != nil {
+			proxyErr <- errAccept
+			return
+		}
+		defer conn.Close()
+
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		reader := bufio.NewReader(conn)
+		req, errRequest := http.ReadRequest(reader)
+		if errRequest != nil {
+			proxyErr <- errRequest
+			return
+		}
+		_ = req.Body.Close()
+
+		proxyConnectHost <- req.Host
+		proxyAuthHeader <- req.Header.Get("Proxy-Authorization")
+
+		upstream, errUpstream := net.Dial("tcp", targetListener.Addr().String())
+		if errUpstream != nil {
+			proxyErr <- errUpstream
+			return
+		}
+		defer upstream.Close()
+
+		_ = upstream.SetDeadline(time.Now().Add(5 * time.Second))
+
+		if _, errWrite := fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); errWrite != nil {
+			proxyErr <- errWrite
+			return
+		}
+
+		buf := make([]byte, 4)
+		if _, errRead := io.ReadFull(reader, buf); errRead != nil {
+			proxyErr <- errRead
+			return
+		}
+		if _, errWrite := upstream.Write(buf); errWrite != nil {
+			proxyErr <- errWrite
+			return
+		}
+		if _, errRead := io.ReadFull(upstream, buf); errRead != nil {
+			proxyErr <- errRead
+			return
+		}
+		if _, errWrite := conn.Write(buf); errWrite != nil {
+			proxyErr <- errWrite
+			return
+		}
+
+		proxyErr <- nil
+	}()
+
+	dialer, mode, errBuild := BuildDialer("http://user:pass@" + proxyListener.Addr().String())
+	if errBuild != nil {
+		t.Fatalf("BuildDialer returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+	if dialer == nil {
+		t.Fatal("expected dialer, got nil")
+	}
+
+	conn, errDial := dialer.Dial("tcp", targetListener.Addr().String())
+	if errDial != nil {
+		t.Fatalf("dialer.Dial returned error: %v", errDial)
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, errWrite := conn.Write([]byte("ping")); errWrite != nil {
+		t.Fatalf("conn.Write returned error: %v", errWrite)
+	}
+
+	reply := make([]byte, 4)
+	if _, errRead := io.ReadFull(conn, reply); errRead != nil {
+		t.Fatalf("conn.Read returned error: %v", errRead)
+	}
+	if string(reply) != "pong" {
+		t.Fatalf("reply = %q, want %q", string(reply), "pong")
+	}
+
+	if gotHost := <-proxyConnectHost; gotHost != targetListener.Addr().String() {
+		t.Fatalf("CONNECT host = %q, want %q", gotHost, targetListener.Addr().String())
+	}
+
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
+	if gotAuth := <-proxyAuthHeader; gotAuth != wantAuth {
+		t.Fatalf("Proxy-Authorization = %q, want %q", gotAuth, wantAuth)
+	}
+
+	if gotPayload := <-targetReceived; gotPayload != "ping" {
+		t.Fatalf("target payload = %q, want %q", gotPayload, "ping")
+	}
+
+	if err := <-proxyErr; err != nil {
+		t.Fatalf("proxy handler failed: %v", err)
+	}
+	if err := <-targetErr; err != nil {
+		t.Fatalf("target handler failed: %v", err)
 	}
 }

@@ -33,6 +33,8 @@ type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	ClaudeAuthModeXAPIKey        = internalconfig.ClaudeAuthModeXAPIKey
+	ClaudeAuthModeBearer         = internalconfig.ClaudeAuthModeBearer
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
@@ -51,4 +53,8 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 
 func NormalizeCommentIndentation(data []byte) []byte {
 	return internalconfig.NormalizeCommentIndentation(data)
+}
+
+func NormalizeClaudeAuthMode(value string) string {
+	return internalconfig.NormalizeClaudeAuthMode(value)
 }

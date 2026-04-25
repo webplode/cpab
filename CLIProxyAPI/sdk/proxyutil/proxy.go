@@ -1,8 +1,12 @@
 package proxyutil
 
 import (
+	"bufio"
 	"context"
+	cryptotls "crypto/tls"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -75,6 +79,123 @@ func cloneDefaultTransport() *http.Transport {
 	return &http.Transport{}
 }
 
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+type httpConnectDialer struct {
+	proxyURL *url.URL
+	forward  proxy.Dialer
+}
+
+func newHTTPConnectDialer(proxyURL *url.URL, forward proxy.Dialer) proxy.Dialer {
+	return &httpConnectDialer{
+		proxyURL: proxyURL,
+		forward:  forward,
+	}
+}
+
+func proxyAddress(proxyURL *url.URL) string {
+	if proxyURL == nil {
+		return ""
+	}
+	if port := proxyURL.Port(); port != "" {
+		return proxyURL.Host
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "https":
+		return net.JoinHostPort(proxyURL.Hostname(), "443")
+	default:
+		return net.JoinHostPort(proxyURL.Hostname(), "80")
+	}
+}
+
+func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	if network == "" {
+		network = "tcp"
+	}
+	if !strings.HasPrefix(network, "tcp") {
+		return nil, fmt.Errorf("HTTP CONNECT proxy only supports TCP, got %q", network)
+	}
+
+	proxyConn, errDial := d.forward.Dial("tcp", proxyAddress(d.proxyURL))
+	if errDial != nil {
+		return nil, fmt.Errorf("dial proxy failed: %w", errDial)
+	}
+
+	conn := proxyConn
+	if strings.EqualFold(d.proxyURL.Scheme, "https") {
+		tlsConn := cryptotls.Client(proxyConn, &cryptotls.Config{
+			ServerName: d.proxyURL.Hostname(),
+			MinVersion: cryptotls.VersionTLS12,
+		})
+		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+			proxyConn.Close()
+			return nil, fmt.Errorf("proxy TLS handshake failed: %w", errHandshake)
+		}
+		conn = tlsConn
+	}
+
+	if errWrite := writeConnectRequest(conn, d.proxyURL, addr); errWrite != nil {
+		conn.Close()
+		return nil, errWrite
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, errResponse := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if errResponse != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read proxy CONNECT response failed: %w", errResponse)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		conn.Close()
+		detail := strings.TrimSpace(string(body))
+		if detail != "" {
+			return nil, fmt.Errorf("proxy CONNECT failed: %s: %s", resp.Status, detail)
+		}
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
+	}
+
+	if reader.Buffered() > 0 {
+		return &bufferedConn{Conn: conn, reader: reader}, nil
+	}
+	return conn, nil
+}
+
+func writeConnectRequest(conn net.Conn, proxyURL *url.URL, addr string) error {
+	var builder strings.Builder
+	builder.Grow(128)
+	builder.WriteString("CONNECT ")
+	builder.WriteString(addr)
+	builder.WriteString(" HTTP/1.1\r\nHost: ")
+	builder.WriteString(addr)
+	builder.WriteString("\r\n")
+
+	if proxyURL != nil && proxyURL.User != nil {
+		username := proxyURL.User.Username()
+		password, _ := proxyURL.User.Password()
+		credentials := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+		builder.WriteString("Proxy-Authorization: Basic ")
+		builder.WriteString(credentials)
+		builder.WriteString("\r\n")
+	}
+
+	builder.WriteString("User-Agent: Go-http-client/1.1\r\n\r\n")
+
+	if _, errWrite := io.WriteString(conn, builder.String()); errWrite != nil {
+		return fmt.Errorf("write proxy CONNECT request failed: %w", errWrite)
+	}
+	return nil
+}
+
 // NewDirectTransport returns a transport that bypasses environment proxies.
 func NewDirectTransport() *http.Transport {
 	clone := cloneDefaultTransport()
@@ -134,6 +255,10 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 	case ModeDirect:
 		return proxy.Direct, setting.Mode, nil
 	case ModeProxy:
+		switch strings.ToLower(setting.URL.Scheme) {
+		case "http", "https":
+			return newHTTPConnectDialer(setting.URL, proxy.Direct), setting.Mode, nil
+		}
 		dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
 		if errDialer != nil {
 			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)

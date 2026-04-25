@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/textproto"
+	"net/url"
 	"strings"
 	"time"
 
@@ -96,9 +96,7 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	if strings.TrimSpace(apiKey) == "" {
 		return nil
 	}
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	if shouldUseClaudeAPIKeyHeader(e.cfg, auth, req.URL) {
 		req.Header.Del("Authorization")
 		req.Header.Set("x-api-key", apiKey)
 	} else {
@@ -659,7 +657,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := claudeauth.NewClaudeAuth(e.cfg)
+	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokens(ctx, refreshToken)
 	if err != nil {
 		return nil, err
@@ -881,11 +879,12 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
-	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	isAnthropicBase := isAnthropicAPIURL(r.URL)
+	if shouldUseClaudeAPIKeyHeader(cfg, auth, r.URL) {
 		r.Header.Del("Authorization")
 		r.Header.Set("x-api-key", apiKey)
 	} else {
+		r.Header.Del("x-api-key")
 		r.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	r.Header.Set("Content-Type", "application/json")
@@ -911,15 +910,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		baseBetas += ",interleaved-thinking-2025-05-14"
 	}
 
-	hasClaude1MHeader := false
-	if ginHeaders != nil {
-		if _, ok := ginHeaders[textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M")]; ok {
-			hasClaude1MHeader = true
-		}
-	}
-
 	// Merge extra betas from request body and request flags.
-	if len(extraBetas) > 0 || hasClaude1MHeader {
+	if len(extraBetas) > 0 {
 		existingSet := make(map[string]bool)
 		for _, b := range strings.Split(baseBetas, ",") {
 			betaName := strings.TrimSpace(b)
@@ -933,9 +925,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 				baseBetas += "," + beta
 				existingSet[beta] = true
 			}
-		}
-		if hasClaude1MHeader && !existingSet["context-1m-2025-08-07"] {
-			baseBetas += ",context-1m-2025-08-07"
 		}
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
@@ -1003,6 +992,34 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func shouldUseClaudeAPIKeyHeader(cfg *config.Config, auth *cliproxyauth.Auth, targetURL *url.URL) bool {
+	if auth == nil || auth.Attributes == nil || strings.TrimSpace(auth.Attributes["api_key"]) == "" {
+		return false
+	}
+	switch config.NormalizeClaudeAuthMode(resolveClaudeAuthMode(cfg, auth)) {
+	case config.ClaudeAuthModeXAPIKey:
+		return true
+	case config.ClaudeAuthModeBearer:
+		return false
+	default:
+		return isAnthropicAPIURL(targetURL)
+	}
+}
+
+func resolveClaudeAuthMode(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	entry := resolveClaudeKeyConfig(cfg, auth)
+	if entry == nil {
+		return ""
+	}
+	return entry.AuthMode
+}
+
+func isAnthropicAPIURL(targetURL *url.URL) bool {
+	return targetURL != nil &&
+		strings.EqualFold(targetURL.Scheme, "https") &&
+		strings.EqualFold(targetURL.Hostname(), "api.anthropic.com")
 }
 
 func checkSystemInstructions(payload []byte) []byte {
