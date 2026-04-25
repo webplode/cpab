@@ -31,9 +31,6 @@ _bmad/
 _bmad-output/
 
 # Documentation & Assets
-AGENTS.md
-CLAUDE.md
-GEMINI.md
 logs/
 
 CLIProxyAPI/.git_backup/
