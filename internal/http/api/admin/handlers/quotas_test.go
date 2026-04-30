@@ -281,6 +281,7 @@ func TestQuotaHandlerListIncludesAuthStatusAndUnwrappedPayload(t *testing.T) {
 func TestQuotaHandlerListIncludesOAuthInfoSummary(t *testing.T) {
 	db := openAdminQuotaTestDB(t)
 	now := time.Date(2026, time.April, 24, 12, 0, 0, 0, time.UTC)
+	expiresAt := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second).Format(time.RFC3339)
 
 	auth := models.Auth{
 		Key: "codex-refreshing.json",
@@ -288,7 +289,7 @@ func TestQuotaHandlerListIncludesOAuthInfoSummary(t *testing.T) {
 			"type":          "codex",
 			"refresh_token": "refresh-token",
 			"last_refresh":  "2026-04-24T10:30:00Z",
-			"expired":       "2026-04-30T00:00:00Z",
+			"expired":       expiresAt,
 		})),
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -343,8 +344,8 @@ func TestQuotaHandlerListIncludesOAuthInfoSummary(t *testing.T) {
 	if oauthInfo["last_refresh"] != "2026-04-24T10:30:00Z" {
 		t.Fatalf("last_refresh = %v, want 2026-04-24T10:30:00Z", oauthInfo["last_refresh"])
 	}
-	if oauthInfo["expires_at"] != "2026-04-30T00:00:00Z" {
-		t.Fatalf("expires_at = %v, want 2026-04-30T00:00:00Z", oauthInfo["expires_at"])
+	if oauthInfo["expires_at"] != expiresAt {
+		t.Fatalf("expires_at = %v, want %s", oauthInfo["expires_at"], expiresAt)
 	}
 	if oauthInfo["has_refresh_token"] != true {
 		t.Fatalf("has_refresh_token = %v, want true", oauthInfo["has_refresh_token"])

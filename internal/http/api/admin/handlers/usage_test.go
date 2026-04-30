@@ -31,13 +31,14 @@ func openAdminUsageTestDB(t *testing.T) *gorm.DB {
 func seedUsageRows(t *testing.T, db *gorm.DB) {
 	t.Helper()
 
-	now := time.Now().UTC()
+	localNow := time.Now().In(time.Local)
+	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 12, 0, 0, 0, time.Local).UTC()
 	rows := []models.Usage{
 		{
 			Provider:     "openai",
 			Model:        "gpt-4.1",
-			RequestedAt:  now.Add(-2 * time.Hour),
-			CreatedAt:    now.Add(-2*time.Hour + 200*time.Millisecond),
+			RequestedAt:  today.Add(-2 * time.Hour),
+			CreatedAt:    today.Add(-2*time.Hour + 200*time.Millisecond),
 			Failed:       false,
 			InputTokens:  120,
 			OutputTokens: 80,
@@ -47,8 +48,8 @@ func seedUsageRows(t *testing.T, db *gorm.DB) {
 		{
 			Provider:     "anthropic",
 			Model:        "claude-sonnet-4.6",
-			RequestedAt:  now.Add(-90 * time.Minute),
-			CreatedAt:    now.Add(-90*time.Minute + 400*time.Millisecond),
+			RequestedAt:  today.Add(-90 * time.Minute),
+			CreatedAt:    today.Add(-90*time.Minute + 400*time.Millisecond),
 			Failed:       true,
 			InputTokens:  90,
 			OutputTokens: 10,
@@ -58,8 +59,8 @@ func seedUsageRows(t *testing.T, db *gorm.DB) {
 		{
 			Provider:     "openai",
 			Model:        "gpt-4.1",
-			RequestedAt:  now.AddDate(0, 0, -1),
-			CreatedAt:    now.AddDate(0, 0, -1).Add(250 * time.Millisecond),
+			RequestedAt:  today.AddDate(0, 0, -1),
+			CreatedAt:    today.AddDate(0, 0, -1).Add(250 * time.Millisecond),
 			Failed:       false,
 			InputTokens:  50,
 			OutputTokens: 25,
