@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/store"
 	"gorm.io/datatypes"

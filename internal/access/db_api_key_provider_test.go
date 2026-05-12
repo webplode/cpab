@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"gorm.io/gorm"
 )
 
