@@ -1,4 +1,4 @@
-FROM node:20-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:20-alpine AS web-builder
 
 WORKDIR /web
 
@@ -10,9 +10,12 @@ COPY web/ ./
 
 RUN npm run build
 
-FROM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /app
+
+ARG TARGETOS
+ARG TARGETARCH
 
 COPY go.mod go.sum ./
 COPY CLIProxyAPI/ ./CLIProxyAPI/
@@ -23,7 +26,7 @@ COPY . .
 
 COPY --from=web-builder /web/dist ./internal/webui/dist
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o ./cpab ./cmd/business/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o ./cpab ./cmd/business/
 
 FROM alpine:3.22.0
 
