@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { AdminDashboardLayout } from '../../components/admin/AdminDashboardLayout';
 import { AdminNoAccessCard } from '../../components/admin/AdminNoAccessCard';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
-import { apiFetchAdmin } from '../../api/config';
+import { API_BASE_URL, TOKEN_KEY_ADMIN, USER_KEY_ADMIN, apiFetchAdmin } from '../../api/config';
 import { Icon } from '../../components/Icon';
 import { buildAdminPermissionKey, useAdminPermissions } from '../../utils/adminPermissions';
 import { useStickyActionsDivider } from '../../utils/stickyActionsDivider';
@@ -312,6 +312,11 @@ interface ImportResponse {
     failed: ImportFailure[];
 }
 
+interface BatchDeleteResponse {
+    deleted: number;
+    missing_ids?: number[];
+}
+
 interface ConfirmDialogState {
     title: string;
     message: string;
@@ -372,6 +377,22 @@ function formatDate(dateStr: string, locale: string): string {
         hour: '2-digit',
         minute: '2-digit',
     });
+}
+
+function filenameFromContentDisposition(header: string | null): string {
+    if (!header) {
+        return '';
+    }
+    const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match?.[1]) {
+        try {
+            return decodeURIComponent(utf8Match[1].trim());
+        } catch {
+            return utf8Match[1].trim();
+        }
+    }
+    const match = header.match(/filename="?([^";]+)"?/i);
+    return match?.[1]?.trim() || '';
 }
 
 interface ParsedOAuthCallback {
@@ -445,6 +466,7 @@ const AUTH_TYPES = [
     { key: 'anthropic', label: 'Anthropic', endpoint: '/v0/admin/tokens/anthropic' },
     { key: 'antigravity', label: 'Antigravity', endpoint: '/v0/admin/tokens/antigravity' },
     { key: 'gemini-cli', label: 'Gemini CLI', endpoint: '/v0/admin/tokens/gemini' },
+    { key: 'kiro', label: 'Kiro', endpoint: '/v0/admin/auth-files' },
     { key: 'iflow-cookie', label: 'iFlow', endpoint: '/v0/admin/tokens/iflow-cookie' },
     { key: 'qwen', label: 'Qwen', endpoint: '/v0/admin/tokens/qwen' },
 ];
@@ -476,6 +498,9 @@ export function AdminAuthFiles() {
         buildAdminPermissionKey('POST', '/v0/admin/tokens/get-auth-status')
     );
     const canImportAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/import'));
+    const canExportAllAuthFiles = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/auth-files/export'));
+    const canExportSelectedAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/export'));
+    const canBatchDeleteAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/batch-delete'));
 
     const [authFiles, setAuthFiles] = useState<AuthFile[]>([]);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -500,6 +525,7 @@ export function AdminAuthFiles() {
     const [importSubmitting, setImportSubmitting] = useState(false);
     const [importError, setImportError] = useState('');
     const [importResult, setImportResult] = useState<ImportResponse | null>(null);
+    const [exporting, setExporting] = useState(false);
     const [importGroupIds, setImportGroupIds] = useState<number[] | null>(null);
     const [importGroupMenuOpen, setImportGroupMenuOpen] = useState(false);
     const [importGroupSearch, setImportGroupSearch] = useState('');
@@ -519,6 +545,15 @@ export function AdminAuthFiles() {
     const [iflowCookie, setIflowCookie] = useState('');
     const [iflowSubmitting, setIflowSubmitting] = useState(false);
     const [iflowError, setIflowError] = useState('');
+    const [kiroKey, setKiroKey] = useState('');
+    const [kiroLabel, setKiroLabel] = useState('');
+    const [kiroRefreshToken, setKiroRefreshToken] = useState('');
+    const [kiroRegion, setKiroRegion] = useState('us-east-1');
+    const [kiroEmail, setKiroEmail] = useState('');
+    const [kiroProfileArn, setKiroProfileArn] = useState('');
+    const [kiroProxyUrl, setKiroProxyUrl] = useState('');
+    const [kiroSubmitting, setKiroSubmitting] = useState(false);
+    const [kiroError, setKiroError] = useState('');
     const [toast, setToast] = useState<{ show: boolean; message: string }>({ show: false, message: '' });
     const [bindModalOpen, setBindModalOpen] = useState(false);
     const [bindSubmitting, setBindSubmitting] = useState(false);
@@ -529,6 +564,7 @@ export function AdminAuthFiles() {
     const [batchGroupIds, setBatchGroupIds] = useState<number[] | null>(null);
     const [batchGroupMenuOpen, setBatchGroupMenuOpen] = useState(false);
     const [batchGroupSearch, setBatchGroupSearch] = useState('');
+    const [batchDeleteSubmitting, setBatchDeleteSubmitting] = useState(false);
     const [selectedProxyIds, setSelectedProxyIds] = useState<Set<number>>(new Set());
     const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -559,25 +595,34 @@ export function AdminAuthFiles() {
     const locale = i18n.language === 'zh-CN' ? 'zh-CN' : 'en-US';
 
     const availableAuthTypes = useMemo(() => {
-        return AUTH_TYPES.filter((type) =>
-            hasPermission(buildAdminPermissionKey('POST', type.endpoint))
-        );
-    }, [hasPermission]);
+        return AUTH_TYPES.filter((type) => {
+            if (!hasPermission(buildAdminPermissionKey('POST', type.endpoint))) {
+                return false;
+            }
+            const needsStatusPolling = type.key !== 'iflow-cookie' && type.key !== 'kiro';
+            return !needsStatusPolling || canCheckAuthStatus;
+        });
+    }, [canCheckAuthStatus, hasPermission]);
 
-    const canRequestAuth = canCreateAuthFiles && canCheckAuthStatus && availableAuthTypes.length > 0;
+    const canRequestAuth = canCreateAuthFiles && availableAuthTypes.length > 0;
     const canOpenNewMenu = canRequestAuth || canImportAuthFiles;
     const canBindProxies = canUpdateAuthFiles && canListProxies;
     const canBatchGroup = canUpdateAuthFiles && canListGroups;
+    const canExportAuthFiles = canExportAllAuthFiles || canExportSelectedAuthFiles;
+    const canSelectAuthFiles = canUpdateAuthFiles || canExportSelectedAuthFiles || canBatchDeleteAuthFiles;
     const visibleIds = authFiles.map((file) => file.id);
     const anyVisibleSelected = visibleIds.some((id) => selectedIds.has(id));
     const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
     const selectedCount = selectedIds.size;
+    const exportSelected = selectedCount > 0;
+    const exportDisabled = exporting || (exportSelected ? !canExportSelectedAuthFiles : !canExportAllAuthFiles);
     const proxyIds = proxies.map((proxy) => proxy.id);
     const anyProxySelected = proxyIds.some((id) => selectedProxyIds.has(id));
     const allProxySelected = proxyIds.length > 0 && proxyIds.every((id) => selectedProxyIds.has(id));
     const selectedProxyCount = selectedProxyIds.size;
     const oauthProvider = authTypeKey ? OAUTH_CALLBACK_PROVIDERS[authTypeKey] : '';
     const isIFlowCookie = authTypeKey === 'iflow-cookie';
+    const isKiroManual = authTypeKey === 'kiro';
 
     useEffect(() => {
         const allOptions = [t('No Group'), ...authGroups.map((g) => g.name)];
@@ -1193,6 +1238,51 @@ export function AdminAuthFiles() {
         });
     };
 
+    const handleBatchDelete = () => {
+        if (!canBatchDeleteAuthFiles || selectedCount === 0 || batchDeleteSubmitting) {
+            return;
+        }
+        const ids = Array.from(selectedIds);
+        setConfirmDialog({
+            title: t('Delete Selected Auth Files'),
+            message: t('Are you sure you want to delete {{count}} selected auth files? This action cannot be undone.', {
+                count: ids.length,
+            }),
+            confirmText: t('Delete'),
+            danger: true,
+            onConfirm: async () => {
+                setBatchDeleteSubmitting(true);
+                try {
+                    const result = await apiFetchAdmin<BatchDeleteResponse>('/v0/admin/auth-files/batch-delete', {
+                        method: 'POST',
+                        body: JSON.stringify({ ids }),
+                    });
+                    setSelectedIds((prev) => {
+                        const next = new Set(prev);
+                        ids.forEach((selectedID) => next.delete(selectedID));
+                        return next;
+                    });
+                    await fetchData();
+                    const missingCount = result.missing_ids?.length || 0;
+                    if (missingCount > 0) {
+                        showToast(t('Deleted {{deleted}} auth files. {{missing}} selected auth files were already missing.', {
+                            deleted: result.deleted,
+                            missing: missingCount,
+                        }));
+                    } else {
+                        showToast(t('Deleted {{count}} auth files', { count: result.deleted }));
+                    }
+                } catch (err) {
+                    console.error('Failed to delete selected auth files:', err);
+                    showToast(err instanceof Error ? err.message : t('Failed to delete selected auth files.'));
+                } finally {
+                    setBatchDeleteSubmitting(false);
+                    setConfirmDialog(null);
+                }
+            },
+        });
+    };
+
     const stopPolling = useCallback(() => {
         if (pollingRef.current) {
             clearInterval(pollingRef.current);
@@ -1289,6 +1379,15 @@ export function AdminAuthFiles() {
         setIflowCookie('');
         setIflowSubmitting(false);
         setIflowError('');
+        setKiroKey('');
+        setKiroLabel('');
+        setKiroRefreshToken('');
+        setKiroRegion('us-east-1');
+        setKiroEmail('');
+        setKiroProfileArn('');
+        setKiroProxyUrl('');
+        setKiroSubmitting(false);
+        setKiroError('');
         setNewAuthGroupMenuOpen(false);
         setNewAuthGroupSearch('');
         setNewAuthGroupIds(null);
@@ -1373,6 +1472,70 @@ export function AdminAuthFiles() {
         }
     };
 
+    const handleExportAuthFiles = async () => {
+        if (!canExportAuthFiles || exporting) {
+            return;
+        }
+        setExporting(true);
+        try {
+            const selectedAuthFileIds = Array.from(selectedIds);
+            const shouldExportSelected = selectedAuthFileIds.length > 0;
+            if (shouldExportSelected && !canExportSelectedAuthFiles) {
+                showToast(t('Permission denied'));
+                return;
+            }
+            if (!shouldExportSelected && !canExportAllAuthFiles) {
+                showToast(t('Permission denied'));
+                return;
+            }
+            const headers: Record<string, string> = {};
+            const token = localStorage.getItem(TOKEN_KEY_ADMIN);
+            if (token) {
+                headers.Authorization = `Bearer ${token}`;
+            }
+            if (shouldExportSelected) {
+                headers['Content-Type'] = 'application/json';
+            }
+            const response = await fetch(`${API_BASE_URL}/v0/admin/auth-files/export`, {
+                method: shouldExportSelected ? 'POST' : 'GET',
+                headers,
+                body: shouldExportSelected ? JSON.stringify({ ids: selectedAuthFileIds }) : undefined,
+            });
+            if (response.status === 401) {
+                localStorage.removeItem(TOKEN_KEY_ADMIN);
+                localStorage.removeItem(USER_KEY_ADMIN);
+                window.location.href = '/admin/login';
+                throw new Error('Unauthorized');
+            }
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.error || `Request failed with status ${response.status}`);
+            }
+
+            const blob = await response.blob();
+            const objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download =
+                filenameFromContentDisposition(response.headers.get('content-disposition')) ||
+                `auth-files-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(objectUrl);
+            showToast(
+                shouldExportSelected
+                    ? t('Selected authentication files exported')
+                    : t('Authentication files exported')
+            );
+        } catch (err) {
+            console.error('Failed to export auth files:', err);
+            showToast(err instanceof Error ? err.message : t('Failed to export auth files.'));
+        } finally {
+            setExporting(false);
+        }
+    };
+
     const handleNewAuthType = async (typeKey: string) => {
         setNewMenuOpen(false);
         const authType = availableAuthTypes.find((t) => t.key === typeKey);
@@ -1388,7 +1551,9 @@ export function AdminAuthFiles() {
         setModalOpen(true);
         setModalUrl('');
         setAuthTypeKey(typeKey);
-        if (typeKey === 'iflow-cookie') {
+        if (typeKey === 'kiro') {
+            setModalTitle(t('Kiro Refresh Token'));
+        } else if (typeKey === 'iflow-cookie') {
             setModalTitle(t('iFlow Cookie'));
         } else {
             setModalTitle(
@@ -1408,6 +1573,15 @@ export function AdminAuthFiles() {
         setIflowCookie('');
         setIflowSubmitting(false);
         setIflowError('');
+        setKiroKey('');
+        setKiroLabel('');
+        setKiroRefreshToken('');
+        setKiroRegion('us-east-1');
+        setKiroEmail('');
+        setKiroProfileArn('');
+        setKiroProxyUrl('');
+        setKiroSubmitting(false);
+        setKiroError('');
         setNewAuthGroupSearch('');
         setNewAuthGroupMenuOpen(false);
         if (canListGroups) {
@@ -1415,6 +1589,10 @@ export function AdminAuthFiles() {
             setNewAuthGroupIds(defaultIds.length > 0 ? defaultIds : null);
         } else {
             setNewAuthGroupIds(null);
+        }
+        if (typeKey === 'kiro') {
+            setModalLoading(false);
+            return;
         }
         if (typeKey === 'iflow-cookie') {
             setModalLoading(false);
@@ -1442,7 +1620,7 @@ export function AdminAuthFiles() {
     };
 
     const handleOpenUrl = () => {
-        window.open(modalUrl, '_blank');
+        window.open(modalUrl, '_blank', 'noopener,noreferrer');
         if (authState && authStatus === 'idle') {
             startPolling(authState);
         }
@@ -1562,6 +1740,105 @@ export function AdminAuthFiles() {
         ]
     );
 
+    const handleSubmitKiroCredential = useCallback(
+        async (event?: FormEvent) => {
+            if (event) {
+                event.preventDefault();
+            }
+            if (kiroSubmitting) {
+                return;
+            }
+
+            const key = kiroKey.trim();
+            const label = kiroLabel.trim();
+            const refreshToken = kiroRefreshToken.trim();
+            const region = kiroRegion.trim();
+            const email = kiroEmail.trim();
+            const profileArn = kiroProfileArn.trim();
+            const proxyUrl = kiroProxyUrl.trim();
+
+            if (!key) {
+                setKiroError(t('Key is required.'));
+                return;
+            }
+            if (!label) {
+                setKiroError(t('Label is required.'));
+                return;
+            }
+            if (!refreshToken) {
+                setKiroError(t('Refresh token is required.'));
+                return;
+            }
+            if (!region) {
+                setKiroError(t('Region is required.'));
+                return;
+            }
+
+            setKiroSubmitting(true);
+            setKiroError('');
+            setAuthStatus('idle');
+            setAuthError('');
+            try {
+                const content: Record<string, unknown> = {
+                    type: 'kiro',
+                    provider: 'kiro',
+                    label,
+                    refresh_token: refreshToken,
+                    region,
+                    auth_method: 'builder_id',
+                };
+                if (email) {
+                    content.email = email;
+                }
+                if (profileArn) {
+                    content.profile_arn = profileArn;
+                }
+
+                const payload: Record<string, unknown> = {
+                    key,
+                    proxy_url: proxyUrl,
+                    content,
+                    is_available: true,
+                };
+                if (canListGroups && newAuthGroupIds !== null) {
+                    payload.auth_group_id = normalizeGroupIds(newAuthGroupIds);
+                }
+
+                await apiFetchAdmin('/v0/admin/auth-files', {
+                    method: 'POST',
+                    body: JSON.stringify(payload),
+                });
+                showToast(t('Kiro credential created successfully'));
+                fetchData();
+                fetchTypes();
+                setModalOpen(false);
+            } catch (err) {
+                console.error('Failed to create Kiro credential:', err);
+                const message = err instanceof Error ? err.message : t('Failed to create Kiro credential.');
+                setKiroError(message);
+            } finally {
+                setKiroSubmitting(false);
+            }
+        },
+        [
+            canListGroups,
+            fetchData,
+            fetchTypes,
+            kiroEmail,
+            kiroKey,
+            kiroLabel,
+            kiroProfileArn,
+            kiroProxyUrl,
+            kiroRefreshToken,
+            kiroRegion,
+            kiroSubmitting,
+            newAuthGroupIds,
+            normalizeGroupIds,
+            showToast,
+            t,
+        ]
+    );
+
     const handleCloseModal = () => {
         stopPolling();
         setModalOpen(false);
@@ -1575,6 +1852,15 @@ export function AdminAuthFiles() {
         setIflowCookie('');
         setIflowSubmitting(false);
         setIflowError('');
+        setKiroKey('');
+        setKiroLabel('');
+        setKiroRefreshToken('');
+        setKiroRegion('us-east-1');
+        setKiroEmail('');
+        setKiroProfileArn('');
+        setKiroProxyUrl('');
+        setKiroSubmitting(false);
+        setKiroError('');
         setNewAuthGroupMenuOpen(false);
         setNewAuthGroupSearch('');
     };
@@ -1596,7 +1882,7 @@ export function AdminAuthFiles() {
             subtitle={t('Manage authentication groups and their configurations.')}
         >
             <div className="space-y-6">
-                {(canOpenNewMenu || canBindProxies || canBatchGroup) && (
+                {(canOpenNewMenu || canBindProxies || canBatchGroup || canBatchDeleteAuthFiles || canExportAuthFiles) && (
                     <div className="flex justify-end gap-2">
                         {canBatchGroup && (
                             <button
@@ -1622,6 +1908,42 @@ export function AdminAuthFiles() {
                             >
                                 <Icon name="link" size={18} />
                                 {t('Bind Proxy Servers')}
+                            </button>
+                        )}
+                        {canBatchDeleteAuthFiles && (
+                            <button
+                                onClick={handleBatchDelete}
+                                disabled={selectedCount === 0 || batchDeleteSubmitting}
+                                title={
+                                    selectedCount === 0
+                                        ? t('Please select at least one auth file.')
+                                        : t('Delete Selected Auth Files')
+                                }
+                                className="flex items-center gap-2 px-4 py-2 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors font-medium border border-red-200 dark:border-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                <Icon name="delete" size={18} />
+                                {batchDeleteSubmitting ? t('Deleting...') : t('Delete Selected')}
+                            </button>
+                        )}
+                        {canExportAuthFiles && (
+                            <button
+                                onClick={handleExportAuthFiles}
+                                disabled={exportDisabled}
+                                title={
+                                    selectedCount > 0 && !canExportSelectedAuthFiles
+                                        ? t('Permission denied')
+                                        : selectedCount > 0
+                                            ? t('Export selected auth files')
+                                            : t('Export Auth Files')
+                                }
+                                className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium border border-gray-200 dark:border-border-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                <Icon name="download" size={18} />
+                                {exporting
+                                    ? t('Exporting...')
+                                    : selectedCount > 0
+                                        ? t('Export Selected')
+                                        : t('Export Auth Files')}
                             </button>
                         )}
                         {canOpenNewMenu && (
@@ -1766,10 +2088,10 @@ export function AdminAuthFiles() {
                             <thead className="text-xs text-gray-700 uppercase bg-gray-50 dark:bg-surface-dark dark:text-gray-400 border-b border-gray-200 dark:border-border-dark">
                                 <tr>
                                     <th className="px-6 py-4">
-                                        <AdminCheckbox
-                                            checked={allVisibleSelected}
-                                            indeterminate={anyVisibleSelected && !allVisibleSelected}
-                                            disabled={loading || !canUpdateAuthFiles || authFiles.length === 0}
+                                            <AdminCheckbox
+                                                checked={allVisibleSelected}
+                                                indeterminate={anyVisibleSelected && !allVisibleSelected}
+                                                disabled={loading || !canSelectAuthFiles || authFiles.length === 0}
                                             onChange={(nextChecked) => {
                                                 setSelectedIds((prev) => {
                                                     const next = new Set(prev);
@@ -1821,9 +2143,9 @@ export function AdminAuthFiles() {
                                             className="hover:bg-gray-50 dark:hover:bg-background-dark group"
                                         >
                                             <td className="px-6 py-4">
-                                                <AdminCheckbox
-                                                    checked={selectedIds.has(file.id)}
-                                                    disabled={!canUpdateAuthFiles}
+                                                    <AdminCheckbox
+                                                        checked={selectedIds.has(file.id)}
+                                                        disabled={!canSelectAuthFiles}
                                                     onChange={(nextChecked) => {
                                                         setSelectedIds((prev) => {
                                                             const next = new Set(prev);
@@ -2367,10 +2689,150 @@ export function AdminAuthFiles() {
                                             </div>
                                         </div>
                                     )}
-                                    {isIFlowCookie ? (
-                                        <form onSubmit={handleSubmitIFlowCookie} className="space-y-4">
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                      {isKiroManual ? (
+                                          <form onSubmit={handleSubmitKiroCredential} className="space-y-4">
+                                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                  <div>
+                                                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                          {t('Key')}
+                                                      </label>
+                                                      <input
+                                                          type="text"
+                                                          value={kiroKey}
+                                                          onChange={(e) => {
+                                                              setKiroKey(e.target.value);
+                                                              if (kiroError) setKiroError('');
+                                                          }}
+                                                          placeholder="kiro-account-1"
+                                                          className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                      />
+                                                  </div>
+                                                  <div>
+                                                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                          {t('Label')}
+                                                      </label>
+                                                      <input
+                                                          type="text"
+                                                          value={kiroLabel}
+                                                          onChange={(e) => {
+                                                              setKiroLabel(e.target.value);
+                                                              if (kiroError) setKiroError('');
+                                                          }}
+                                                          placeholder="Kiro Account 1"
+                                                          className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                      />
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                      {t('Refresh Token')}
+                                                  </label>
+                                                  <input
+                                                      type="password"
+                                                      value={kiroRefreshToken}
+                                                      autoComplete="off"
+                                                      onChange={(e) => {
+                                                          setKiroRefreshToken(e.target.value);
+                                                          if (kiroError) setKiroError('');
+                                                      }}
+                                                      className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                  />
+                                              </div>
+                                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                  <div>
+                                                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                          {t('Region')}
+                                                      </label>
+                                                      <input
+                                                          type="text"
+                                                          value={kiroRegion}
+                                                          onChange={(e) => {
+                                                              setKiroRegion(e.target.value);
+                                                              if (kiroError) setKiroError('');
+                                                          }}
+                                                          placeholder="us-east-1"
+                                                          className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                      />
+                                                  </div>
+                                                  <div>
+                                                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                          {t('Email')}
+                                                      </label>
+                                                      <input
+                                                          type="email"
+                                                          value={kiroEmail}
+                                                          onChange={(e) => {
+                                                              setKiroEmail(e.target.value);
+                                                              if (kiroError) setKiroError('');
+                                                          }}
+                                                          placeholder="admin@example.com"
+                                                          className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                      />
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                      {t('Profile ARN')}
+                                                  </label>
+                                                  <input
+                                                      type="text"
+                                                      value={kiroProfileArn}
+                                                      onChange={(e) => {
+                                                          setKiroProfileArn(e.target.value);
+                                                          if (kiroError) setKiroError('');
+                                                      }}
+                                                      placeholder="arn:aws:sso:::permissionSet/..."
+                                                      className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                  />
+                                              </div>
+                                              <div>
+                                                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                                      {t('Proxy URL')}
+                                                  </label>
+                                                  <input
+                                                      type="text"
+                                                      value={kiroProxyUrl}
+                                                      onChange={(e) => {
+                                                          setKiroProxyUrl(e.target.value);
+                                                          if (kiroError) setKiroError('');
+                                                      }}
+                                                      placeholder="socks5://user:password@host:port/"
+                                                      className="block w-full p-2.5 text-sm text-slate-900 dark:text-white bg-white dark:bg-background-dark border border-gray-300 dark:border-border-dark rounded-lg focus:ring-primary focus:border-primary"
+                                                  />
+                                              </div>
+                                              {kiroError && (
+                                                  <div className="text-sm text-red-600 dark:text-red-400">
+                                                      {kiroError}
+                                                  </div>
+                                              )}
+                                              <div className="flex gap-3">
+                                                  <button
+                                                      type="button"
+                                                      onClick={handleCloseModal}
+                                                      disabled={kiroSubmitting}
+                                                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white border border-gray-300 dark:border-border-dark rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium disabled:opacity-50"
+                                                  >
+                                                      {t('Cancel')}
+                                                  </button>
+                                                  <button
+                                                      type="submit"
+                                                      disabled={
+                                                          kiroSubmitting ||
+                                                          kiroKey.trim() === '' ||
+                                                          kiroLabel.trim() === '' ||
+                                                          kiroRefreshToken.trim() === '' ||
+                                                          kiroRegion.trim() === ''
+                                                      }
+                                                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-white rounded-lg hover:bg-primary-dark transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                                                  >
+                                                      {kiroSubmitting ? t('Saving...') : t('Save')}
+                                                  </button>
+                                              </div>
+                                          </form>
+                                      ) : isIFlowCookie ? (
+                                          <form onSubmit={handleSubmitIFlowCookie} className="space-y-4">
+                                              <div>
+                                                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                                                     {t('iFlow Cookie')}
                                                 </label>
                                                 <input
@@ -2505,10 +2967,10 @@ export function AdminAuthFiles() {
                                                         </>
                                                     )}
                                                 </div>
-                                                {authStatus === 'polling' && !isIFlowCookie && (
-                                                    <span className="text-xs text-gray-500 dark:text-gray-500">
-                                                        {t('Poll count: {{count}}', { count: pollCount })}
-                                                    </span>
+                                                  {authStatus === 'polling' && !isIFlowCookie && !isKiroManual && (
+                                                      <span className="text-xs text-gray-500 dark:text-gray-500">
+                                                          {t('Poll count: {{count}}', { count: pollCount })}
+                                                      </span>
                                                 )}
                                             </div>
                                         </div>

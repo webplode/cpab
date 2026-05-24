@@ -12,6 +12,7 @@ This guide covers every configurable entity in the admin dashboard, how they rel
   - [3. Auth Groups](#3-auth-groups)
   - [4. Provider API Keys](#4-provider-api-keys)
   - [5. Auth Files (Credentials)](#5-auth-files-credentials)
+    - [Kiro credentials](#kiro-credentials)
   - [6. Proxies](#6-proxies)
   - [7. Model Mappings](#7-model-mappings)
   - [8. Billing Rules](#8-billing-rules)
@@ -208,6 +209,56 @@ Each auth entry also has:
 - **Priority** (int) - Higher priority credentials are selected first
 - **Is Available** (bool) - Can be toggled on/off
 
+#### Kiro credentials
+
+Kiro is configured as an Auth File with `type`/`provider` set to `kiro`. It is not an OpenAI-compatible provider: CPAB uses the local CLIProxyAPI Kiro executor to call Amazon CodeWhisperer/Kiro, refresh access tokens, decode AWS EventStream frames, and emit OpenAI-compatible stream chunks.
+
+Minimum fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `key` | Yes | Stable credential key shown in admin lists and used for usage attribution |
+| `content.label` | Yes | Human-readable account label |
+| `content.refresh_token` | Yes | Kiro refresh token. Admin list/detail responses redact this value |
+| `content.region` | Yes | AWS region for Kiro endpoints. Default: `us-east-1` |
+| `proxy_url` | No | Per-credential proxy. Overrides the global proxy for Kiro requests |
+| `content.email` | No | Account hint for operators |
+| `content.profile_arn` | No | Profile ARN injected into Kiro requests when needed |
+
+CPAB persists derived `access_token`, rotated `refresh_token`, expiry, and client registration metadata in the same auth content JSON. Token refresh runs before expiry and after token-related `401`/`403` failures; concurrent refreshes for the same account are de-duplicated by the SDK.
+
+To import a Kiro account, obtain a refresh token from an existing Kiro/Amazon Builder ID session or from an operator-managed credential export, then create an Auth File with the fields above. CPAB does not perform the interactive Kiro login flow in the admin UI. Treat the refresh token like a password: do not paste it into logs, tickets, or screenshots, and rotate/re-import it if the source account signs out or the token is revoked.
+
+Kiro model IDs may use synthetic suffixes:
+
+- Base model: `claude-sonnet-4.5`
+- Thinking: `claude-sonnet-4.5-thinking`
+- Agentic: `claude-sonnet-4.5-agentic`
+- Thinking plus agentic: `claude-sonnet-4.5-thinking-agentic`
+
+The suffixes are local CPAB behavior. The executor strips them before sending the upstream Kiro model and applies the requested thinking/agentic behavior explicitly. Billing rules should be configured for the exposed model name, or via the default fallback billing rule.
+
+Model testing is available through the backend admin endpoints even when the current frontend build does not expose dedicated Kiro controls:
+
+- `POST /v0/admin/model-tests` tests one model through the normal `/v1/chat/completions` proxy path.
+- `POST /v0/admin/model-tests/batch` tests multiple models and warms the first model before parallel checks to avoid refresh races.
+
+Kiro does not currently expose a stable quota endpoint for CPAB to poll. The quota poller treats Kiro as auth-health polling: it refreshes expiring access tokens, records healthy/re-login status for the Quota page, and leaves customer-facing request limits to CPAB model mapping rate limits and billing/quota enforcement.
+
+Limitations:
+
+- Kiro/CodeWhisperer desktop APIs are unofficial/private integration points and may change without notice.
+- Account-level model availability can differ even when CPAB lists a model variant.
+- CPAB can retry/fall back only before the first client-visible stream payload. After any stream bytes are sent, later upstream/proxy/client failures are reported to the caller rather than hidden by another retry.
+
+Troubleshooting:
+
+- `401` or `403 invalid bearer token`: the stored refresh token is used to refresh access. If refresh also fails, re-import the Kiro refresh token.
+- Model unavailable: verify the account has access to the base Kiro model and refresh the supported model catalog.
+- Proxy failure: test or replace the per-credential proxy; long Kiro streams are sensitive to unstable proxies.
+- Stream closes mid-output: CPAB cannot transparently retry after bytes have been sent to the client. Check logs for `upstream_close`, proxy reset, or client disconnect symptoms.
+- Secret redaction: token fields are redacted in admin responses and model-test errors.
+
 ---
 
 ### 6. Proxies
@@ -226,6 +277,50 @@ HTTP/HTTPS/SOCKS5 proxies for upstream provider requests.
 
 Supports **batch add** by pasting one proxy URL per line (e.g. `socks5://user:pass@host:port`).
 
+#### Proxy liveness check reference
+
+CPAB checks proxy liveness only when an administrator clicks **Check** or **Check Selected** in the Proxies page. The frontend calls `POST /v0/admin/proxies/:id/check`; the backend does not continuously ping proxies in the background.
+
+The backend loads the saved proxy URL, builds an HTTP transport with `proxyutil.BuildHTTPTransport`, and sends a `GET` request through that exact proxy configuration to an external IP echo service. Supported saved proxy schemes are `http`, `https`, and `socks5`.
+
+A proxy is marked live only when:
+
+- The proxy URL can be parsed and configured.
+- The proxy can establish an HTTPS tunnel to the target.
+- The check service returns an HTTP 2xx response within 15 seconds.
+- The response body contains a valid IP address, either as JSON `{ "ip": "..." }` or plain text.
+
+Default check services are tried in this order until one succeeds:
+
+| Service | Target URL | Response |
+|---------|------------|----------|
+| `4.ident.me` | `https://4.ident.me/` | Plain IPv4 text |
+| `l2.io` | `https://l2.io/ip.json` | JSON `{ "ip": "..." }` |
+| `ipify` | `https://api.ipify.org?format=json` | JSON `{ "ip": "..." }` |
+| `ipinfo` | `https://ipinfo.io/ip` | Plain IP text |
+
+The endpoint also accepts an optional `service` query parameter to force one service, using names such as `ipify`, `ipinfo`, `ident4`, `4.ident.me`, `l2`, or `l2.io`.
+
+Fallback is only useful after the proxy request reaches the IP-check step. If the proxy fails while configuring the URL, authenticating, or opening the HTTPS CONNECT tunnel, the backend stops immediately and returns a proxy-specific diagnosis instead of repeating the same proxy failure against every IP provider.
+
+> **Important:** `https://host:port` means TLS to the proxy server itself. Many proxy providers label a proxy as "HTTPS" because it supports HTTPS destinations via CONNECT, but the proxy URL should still be saved as `http://host:port`. If a check fails with `proxyconnect tcp: EOF`, first verify the protocol field and credentials.
+
+The response includes `live`, `ip`, `service`, `target_url`, `latency_ms`, `checked_at`, and, when available, `status_code`, `error`, `failure_stage`, `diagnosis`, `hint`, or `suggested_proxy_url`.
+
+The dashboard can run the same per-proxy test endpoint for one proxy or all selected proxies. Bulk checks run with browser-side concurrency 10.
+
+After a proxy test, CPAB stores:
+
+| Field | Value |
+|-------|-------|
+| `test_status` | `active` when live, `error` when dead, `new` before testing |
+| `last_tested_at` | Current timestamp |
+| `last_error` | Empty when live, otherwise the failure reason |
+| `last_checked_ip` | The IP returned by the successful check |
+| `is_active` | Set to the test result (`true` for live, `false` for dead) |
+
+Runtime proxy selection does not re-test the proxy on every request. Auto-assignment only selects rows where `is_active === true` and the proxy URL is non-empty. Existing auth files or provider keys that already reference a proxy URL continue to use the configured URL directly.
+
 ---
 
 ### 7. Model Mappings
@@ -236,7 +331,7 @@ Model Mappings define which models are exposed to users and how requests are rou
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| Provider | dropdown | Yes | `gemini`, `codex`, `claude`, `openai-compatibility` |
+| Provider | dropdown | Yes | `gemini`, `codex`, `claude`, `kiro`, `openai-compatibility` |
 | Model Name | string | Yes | Internal/upstream model name |
 | New Model Name | string | Yes | Name exposed to API consumers |
 | Selector | enum | Yes | Routing strategy for auth credentials |
@@ -267,6 +362,12 @@ Each model mapping can have payload rules that inject or override parameters for
 Param rule types:
 - `default` - Set value only if not already present in the request
 - `override` - Always replace the value
+
+**Model tests:**
+
+Admins can call `POST /v0/admin/model-tests` for one model or `POST /v0/admin/model-tests/batch` for multiple models. These endpoints make an in-process request to CPAB's own `/v1/chat/completions` route using an API key or API key ID supplied in the request, so normal API-key auth, balance checks, model mapping, user-group restrictions, usage recording, and billing deductions still apply.
+
+For Kiro batch tests, omit `models` and set `provider` to `kiro` to test the currently registered Kiro catalog, including synthetic `-thinking`, `-agentic`, and `-thinking-agentic` variants. The first model is warmed serially before the remaining models run with bounded parallelism. Results include `ok`, `latency_ms`, HTTP status, a redacted preview/error, and one of these error types: `auth_failure`, `invalid_bearer_token`, `model_unavailable`, `proxy_failure`, `upstream_close`, `client_disconnect`, `timeout`, `upstream_error`, or `request_failed`.
 
 ---
 

@@ -10,8 +10,10 @@ import (
 type Usage struct {
 	ID uint64 `gorm:"primaryKey;autoIncrement"` // Primary key.
 
-	Provider string `gorm:"type:text;not null;index"` // Provider name.
-	Model    string `gorm:"type:text;not null;index"` // Model name.
+	Provider       string `gorm:"type:text;not null;index"` // Provider name.
+	Model          string `gorm:"type:text;not null;index"` // Billable/public model name.
+	RequestedModel string `gorm:"type:text;index"`          // Client-requested model name.
+	UpstreamModel  string `gorm:"type:text;index"`          // Upstream/base model name.
 
 	UserID      *uint64 `gorm:"index"` // Related user ID.
 	UserGroupID *uint64 `gorm:"index"` // Billing user group ID, when available.

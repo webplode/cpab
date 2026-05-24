@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	dbutil "github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"gorm.io/datatypes"
@@ -51,6 +53,15 @@ type importAuthFilesResponse struct {
 	Failed   []importAuthFilesFailure `json:"failed"`
 }
 
+type authImportEntry struct {
+	File    string
+	Payload map[string]any
+}
+
+type idListRequest struct {
+	IDs []uint64 `json:"ids"`
+}
+
 // Create creates a new auth file entry.
 func (h *AuthFileHandler) Create(c *gin.Context) {
 	var body createAuthFileRequest
@@ -72,6 +83,14 @@ func (h *AuthFileHandler) Create(c *gin.Context) {
 	proxyURL := ""
 	if body.ProxyURL != nil {
 		proxyURL = strings.TrimSpace(*body.ProxyURL)
+		if proxyURL != "" {
+			normalizedProxyURL, errNormalizeProxy := normalizeProxyURL(proxyURL)
+			if errNormalizeProxy != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid proxy_url"})
+				return
+			}
+			proxyURL = normalizedProxyURL
+		}
 	}
 	if proxyURL == "" && autoAssignProxyEnabled() {
 		assignedProxyURL, errAssignProxy := pickRandomProxyURL(c.Request.Context(), h.db)
@@ -86,6 +105,11 @@ func (h *AuthFileHandler) Create(c *gin.Context) {
 
 	contentJSON := datatypes.JSON("{}")
 	if body.Content != nil {
+		ensureAuthPayloadType(body.Content)
+		if errValidate := validateKiroAuthPayload(body.Content); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return
+		}
 		contentBytes, errMarshal := json.Marshal(body.Content)
 		if errMarshal == nil {
 			contentJSON = datatypes.JSON(contentBytes)
@@ -132,7 +156,7 @@ func (h *AuthFileHandler) Create(c *gin.Context) {
 		"key":           auth.Key,
 		"auth_group_id": auth.AuthGroupID.Clean(),
 		"proxy_url":     auth.ProxyURL,
-		"content":       auth.Content,
+		"content":       authContentForResponse(auth.Content),
 		"is_available":  auth.IsAvailable,
 		"rate_limit":    auth.RateLimit,
 		"priority":      auth.Priority,
@@ -180,7 +204,6 @@ func (h *AuthFileHandler) Import(c *gin.Context) {
 		}
 	}
 
-	now := time.Now().UTC()
 	imported := 0
 	failures := make([]importAuthFilesFailure, 0)
 
@@ -220,105 +243,177 @@ func (h *AuthFileHandler) Import(c *gin.Context) {
 			continue
 		}
 
-		var payload map[string]any
-		if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		entries, errParseEntries := parseAuthImportEntries(file.Filename, data)
+		if errParseEntries != nil {
 			failures = append(failures, importAuthFilesFailure{
 				File:  file.Filename,
-				Error: "invalid json",
+				Error: errParseEntries.Error(),
 			})
 			continue
 		}
-
-		key := ""
-		if idValue, okID := payload["id"].(string); okID {
-			key = strings.TrimSpace(idValue)
-		}
-		if key == "" {
-			if keyValue, okKey := payload["key"].(string); okKey {
-				key = strings.TrimSpace(keyValue)
-			}
-		}
-		if key == "" {
-			key = strings.TrimSpace(file.Filename)
-		}
-		if key == "" {
-			failures = append(failures, importAuthFilesFailure{
-				File:  file.Filename,
-				Error: "missing key",
-			})
-			continue
-		}
-
-		if _, okType := payload["type"]; !okType {
-			if provider, okProvider := payload["provider"].(string); okProvider && strings.TrimSpace(provider) != "" {
-				payload["type"] = strings.TrimSpace(provider)
-			} else if metadataValue, okMetadata := payload["metadata"].(map[string]any); okMetadata {
-				if typeValue, okType := metadataValue["type"].(string); okType && strings.TrimSpace(typeValue) != "" {
-					payload["type"] = strings.TrimSpace(typeValue)
-				}
-			}
-		}
-
-		proxyURL := ""
-		if proxyValue, okProxy := payload["proxy_url"].(string); okProxy {
-			proxyURL = strings.TrimSpace(proxyValue)
-		}
-		if proxyURL == "" && autoAssignProxyEnabled() {
-			assignedProxyURL, errAssignProxy := pickRandomProxyURL(c.Request.Context(), h.db)
-			if errAssignProxy != nil {
+		for _, entry := range entries {
+			errImport := h.importAuthPayload(c.Request.Context(), entry.File, entry.Payload, authGroupIDs, groupProvided)
+			if errImport != nil {
 				failures = append(failures, importAuthFilesFailure{
-					File:  file.Filename,
-					Error: "auto assign proxy failed",
+					File:  entry.File,
+					Error: errImport.Error(),
 				})
 				continue
 			}
-			if assignedProxyURL != "" {
-				proxyURL = assignedProxyURL
-			}
+			imported++
 		}
-
-		contentBytes, errMarshal := json.Marshal(payload)
-		if errMarshal != nil {
-			failures = append(failures, importAuthFilesFailure{
-				File:  file.Filename,
-				Error: "marshal json failed",
-			})
-			continue
-		}
-
-		auth := models.Auth{
-			Key:         key,
-			AuthGroupID: authGroupIDs,
-			ProxyURL:    proxyURL,
-			Content:     datatypes.JSON(contentBytes),
-			IsAvailable: true,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}
-
-		errCreate := h.db.WithContext(c.Request.Context()).Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "key"}},
-			DoUpdates: clause.Assignments(map[string]any{
-				"auth_group_id": auth.AuthGroupID,
-				"proxy_url":     auth.ProxyURL,
-				"content":       auth.Content,
-				"updated_at":    now,
-			}),
-		}).Create(&auth).Error
-		if errCreate != nil {
-			failures = append(failures, importAuthFilesFailure{
-				File:  file.Filename,
-				Error: "import auth file failed",
-			})
-			continue
-		}
-		imported++
 	}
 
 	c.JSON(http.StatusOK, importAuthFilesResponse{
 		Imported: imported,
 		Failed:   failures,
 	})
+}
+
+// Export downloads every auth file as one nested JSON bundle.
+func (h *AuthFileHandler) Export(c *gin.Context) {
+	h.export(c, nil)
+}
+
+// ExportSelected downloads selected auth files as one nested JSON bundle.
+func (h *AuthFileHandler) ExportSelected(c *gin.Context) {
+	ids, ok := bindRequestIDList(c)
+	if !ok {
+		return
+	}
+	h.export(c, ids)
+}
+
+func (h *AuthFileHandler) export(c *gin.Context, ids []uint64) {
+	var rows []models.Auth
+	q := h.db.WithContext(c.Request.Context()).Order("key ASC")
+	if len(ids) > 0 {
+		q = q.Where("id IN ?", ids)
+	}
+	if errFind := q.Find(&rows).Error; errFind != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "export auth files failed"})
+		return
+	}
+
+	authFiles := make(map[string]map[string]any, len(rows))
+	for _, row := range rows {
+		payload := buildAuthExportPayload(row)
+		fileName := exportAuthFileName(row.Key)
+		if _, exists := authFiles[fileName]; exists {
+			fileName = fmt.Sprintf("%d-%s", row.ID, fileName)
+		}
+		authFiles[fileName] = payload
+	}
+
+	data, errMarshal := json.MarshalIndent(gin.H{"authFiles": authFiles}, "", "  ")
+	if errMarshal != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal auth export failed"})
+		return
+	}
+
+	fileName := fmt.Sprintf("auth-files-%s.json", time.Now().UTC().Format("20060102T150405Z"))
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+	c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+}
+
+func (h *AuthFileHandler) importAuthPayload(ctx context.Context, fileName string, payload map[string]any, requestAuthGroupIDs models.AuthGroupIDs, groupProvided bool) error {
+	if payload == nil {
+		return errors.New("json object is required")
+	}
+
+	key := strings.TrimSpace(stringValue(payload["id"]))
+	if key == "" {
+		key = strings.TrimSpace(stringValue(payload["key"]))
+	}
+	if key == "" {
+		key = strings.TrimSpace(fileName)
+	}
+	if key == "" {
+		return errors.New("missing key")
+	}
+
+	ensureAuthPayloadType(payload)
+	if errValidate := validateKiroAuthPayload(payload); errValidate != nil {
+		return errValidate
+	}
+
+	proxyURL := strings.TrimSpace(stringValue(payload["proxy_url"]))
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(stringValue(payload["proxyUrl"]))
+	}
+	if proxyURL != "" {
+		normalizedProxyURL, errNormalizeProxy := normalizeProxyURL(proxyURL)
+		if errNormalizeProxy != nil {
+			return errors.New("invalid proxy_url")
+		}
+		proxyURL = normalizedProxyURL
+	}
+	if proxyURL == "" && autoAssignProxyEnabled() {
+		assignedProxyURL, errAssignProxy := pickRandomProxyURL(ctx, h.db)
+		if errAssignProxy != nil {
+			return errors.New("auto assign proxy failed")
+		}
+		if assignedProxyURL != "" {
+			proxyURL = assignedProxyURL
+		}
+	}
+
+	authGroupIDs := requestAuthGroupIDs
+	if !groupProvided {
+		if payloadGroupIDs, okGroups := authGroupIDsFromPayload(payload); okGroups {
+			authGroupIDs = payloadGroupIDs.Clean()
+		}
+	}
+
+	isAvailable, hasIsAvailable := boolField(payload, "isActive", "is_active")
+	if !hasIsAvailable {
+		isAvailable = true
+	}
+	rateLimit, hasRateLimit := intField(payload, "rateLimit", "rate_limit")
+	priority, hasPriority := intField(payload, "priority")
+
+	contentBytes, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return errors.New("marshal json failed")
+	}
+
+	now := time.Now().UTC()
+	auth := models.Auth{
+		Key:         key,
+		AuthGroupID: authGroupIDs,
+		ProxyURL:    proxyURL,
+		Content:     datatypes.JSON(contentBytes),
+		IsAvailable: isAvailable,
+		RateLimit:   rateLimit,
+		Priority:    priority,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	updates := map[string]any{
+		"auth_group_id": auth.AuthGroupID,
+		"proxy_url":     auth.ProxyURL,
+		"content":       auth.Content,
+		"updated_at":    now,
+	}
+	if hasIsAvailable {
+		updates["is_available"] = auth.IsAvailable
+	}
+	if hasRateLimit {
+		updates["rate_limit"] = auth.RateLimit
+	}
+	if hasPriority {
+		updates["priority"] = auth.Priority
+	}
+
+	errCreate := h.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.Assignments(updates),
+	}).Create(&auth).Error
+	if errCreate != nil {
+		return errors.New("import auth file failed")
+	}
+	return nil
 }
 
 // List returns auth files with optional filters.
@@ -364,7 +459,7 @@ func (h *AuthFileHandler) List(c *gin.Context) {
 			"key":           row.Key,
 			"auth_group_id": authGroupIDs,
 			"proxy_url":     row.ProxyURL,
-			"content":       row.Content,
+			"content":       authContentForResponse(row.Content),
 			"is_available":  row.IsAvailable,
 			"rate_limit":    row.RateLimit,
 			"priority":      row.Priority,
@@ -406,7 +501,7 @@ func (h *AuthFileHandler) Get(c *gin.Context) {
 		"key":           auth.Key,
 		"auth_group_id": authGroupIDs,
 		"proxy_url":     auth.ProxyURL,
-		"content":       auth.Content,
+		"content":       authContentForResponse(auth.Content),
 		"is_available":  auth.IsAvailable,
 		"rate_limit":    auth.RateLimit,
 		"priority":      auth.Priority,
@@ -452,9 +547,23 @@ func (h *AuthFileHandler) Update(c *gin.Context) {
 		updates["auth_group_id"] = body.AuthGroupID.Clean()
 	}
 	if body.ProxyURL != nil {
-		updates["proxy_url"] = strings.TrimSpace(*body.ProxyURL)
+		proxyURL := strings.TrimSpace(*body.ProxyURL)
+		if proxyURL != "" {
+			normalizedProxyURL, errNormalizeProxy := normalizeProxyURL(proxyURL)
+			if errNormalizeProxy != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid proxy_url"})
+				return
+			}
+			proxyURL = normalizedProxyURL
+		}
+		updates["proxy_url"] = proxyURL
 	}
 	if body.Content != nil {
+		ensureAuthPayloadType(body.Content)
+		if errValidate := validateKiroAuthPayload(body.Content); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return
+		}
 		contentBytes, errMarshal := json.Marshal(body.Content)
 		if errMarshal == nil {
 			updates["content"] = datatypes.JSON(contentBytes)
@@ -500,6 +609,44 @@ func (h *AuthFileHandler) Delete(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// BatchDelete removes selected auth file entries.
+func (h *AuthFileHandler) BatchDelete(c *gin.Context) {
+	ids, ok := bindRequestIDList(c)
+	if !ok {
+		return
+	}
+
+	var (
+		deleted    int64
+		missingIDs []uint64
+	)
+	errDelete := h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		existingIDs, errExisting := loadExistingIDs(tx, &models.Auth{}, ids)
+		if errExisting != nil {
+			return errExisting
+		}
+		missingIDs = missingUint64IDs(ids, existingIDs)
+		if len(existingIDs) == 0 {
+			return nil
+		}
+		res := tx.Delete(&models.Auth{}, "id IN ?", existingIDs)
+		if res.Error != nil {
+			return res.Error
+		}
+		deleted = res.RowsAffected
+		return nil
+	})
+	if errDelete != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "batch delete auth files failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"deleted":     deleted,
+		"missing_ids": missingIDs,
+	})
 }
 
 // SetAvailable marks an auth file as available.
@@ -581,6 +728,336 @@ func parseAuthGroupIDsInput(value string) (models.AuthGroupIDs, error) {
 	return authGroupIDsFromValues([]uint64{parsed}), nil
 }
 
+func parseAuthImportEntries(fileName string, data []byte) ([]authImportEntry, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var root any
+	if errDecode := decoder.Decode(&root); errDecode != nil {
+		return nil, errors.New("invalid json")
+	}
+
+	switch value := root.(type) {
+	case map[string]any:
+		if isAuthPayloadObject(value) {
+			return []authImportEntry{{File: fileName, Payload: value}}, nil
+		}
+		for _, bundleKey := range []string{"authFiles", "auth_files", "files"} {
+			if bundleValue, ok := value[bundleKey]; ok {
+				return importEntriesFromBundleValue(fileName, bundleValue)
+			}
+		}
+		if entries, ok := importEntriesFromObjectMap(value); ok {
+			return entries, nil
+		}
+		return []authImportEntry{{File: fileName, Payload: value}}, nil
+	case []any:
+		return importEntriesFromArray(fileName, value)
+	default:
+		return nil, errors.New("json must be an object")
+	}
+}
+
+func importEntriesFromBundleValue(fileName string, value any) ([]authImportEntry, error) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if entries, ok := importEntriesFromObjectMap(typed); ok {
+			return entries, nil
+		}
+		return nil, errors.New("nested auth files must be json objects")
+	case []any:
+		return importEntriesFromArray(fileName, typed)
+	default:
+		return nil, errors.New("nested auth files must be json objects")
+	}
+}
+
+func importEntriesFromObjectMap(values map[string]any) ([]authImportEntry, bool) {
+	if len(values) == 0 {
+		return nil, false
+	}
+	entries := make([]authImportEntry, 0, len(values))
+	for name, rawPayload := range values {
+		payload, okPayload := rawPayload.(map[string]any)
+		if !okPayload {
+			return nil, false
+		}
+		entries = append(entries, authImportEntry{
+			File:    strings.TrimSpace(name),
+			Payload: payload,
+		})
+	}
+	if len(entries) == 0 {
+		return nil, false
+	}
+	return entries, true
+}
+
+func importEntriesFromArray(fileName string, values []any) ([]authImportEntry, error) {
+	entries := make([]authImportEntry, 0, len(values))
+	for idx, rawPayload := range values {
+		payload, okPayload := rawPayload.(map[string]any)
+		if !okPayload {
+			return nil, errors.New("nested auth files must be json objects")
+		}
+		entryName := strings.TrimSpace(stringValue(payload["id"]))
+		if entryName == "" {
+			entryName = strings.TrimSpace(stringValue(payload["key"]))
+		}
+		if entryName == "" {
+			entryName = fmt.Sprintf("%s[%d]", fileName, idx)
+		}
+		entries = append(entries, authImportEntry{
+			File:    entryName,
+			Payload: payload,
+		})
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("no auth files found")
+	}
+	return entries, nil
+}
+
+func isAuthPayloadObject(payload map[string]any) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	for _, key := range []string{
+		"accessToken",
+		"refreshToken",
+		"provider",
+		"authType",
+		"email",
+		"type",
+		"key",
+		"id",
+	} {
+		if _, ok := payload[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureAuthPayloadType(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	if strings.TrimSpace(stringValue(payload["type"])) != "" {
+		return
+	}
+	if provider := strings.TrimSpace(stringValue(payload["provider"])); provider != "" {
+		payload["type"] = provider
+		return
+	}
+	if metadataValue, okMetadata := payload["metadata"].(map[string]any); okMetadata {
+		if typeValue := strings.TrimSpace(stringValue(metadataValue["type"])); typeValue != "" {
+			payload["type"] = typeValue
+		}
+	}
+}
+
+func validateKiroAuthPayload(payload map[string]any) error {
+	if payload == nil {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(stringValue(payload["provider"])))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(stringValue(payload["type"])))
+	}
+	if provider != cliproxyauth.KiroProvider {
+		return nil
+	}
+	required := []struct {
+		key   string
+		label string
+	}{
+		{"label", "label"},
+		{"refresh_token", "refresh_token"},
+		{"region", "region"},
+	}
+	for _, field := range required {
+		if strings.TrimSpace(stringValue(payload[field.key])) == "" {
+			return fmt.Errorf("kiro auth: %s is required", field.label)
+		}
+	}
+	return nil
+}
+
+func buildAuthExportPayload(row models.Auth) map[string]any {
+	payload := make(map[string]any)
+	if len(row.Content) > 0 {
+		_ = json.Unmarshal(row.Content, &payload)
+	}
+	if payload == nil {
+		payload = make(map[string]any)
+	}
+
+	provider := strings.TrimSpace(stringValue(payload["provider"]))
+	if provider == "" {
+		provider = strings.TrimSpace(stringValue(payload["type"]))
+	}
+	if provider != "" {
+		payload["provider"] = provider
+	}
+	delete(payload, "type")
+	return payload
+}
+
+func bindRequestIDList(c *gin.Context) ([]uint64, bool) {
+	var body idListRequest
+	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return nil, false
+	}
+	ids := cleanUint64IDs(body.IDs)
+	if len(ids) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ids is required"})
+		return nil, false
+	}
+	return ids, true
+}
+
+func cleanUint64IDs(ids []uint64) []uint64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[uint64]struct{}, len(ids))
+	out := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func loadExistingIDs(db *gorm.DB, model any, ids []uint64) ([]uint64, error) {
+	existingIDs := make([]uint64, 0, len(ids))
+	if len(ids) == 0 {
+		return existingIDs, nil
+	}
+	if errFind := db.Model(model).Where("id IN ?", ids).Pluck("id", &existingIDs).Error; errFind != nil {
+		return nil, errFind
+	}
+	return existingIDs, nil
+}
+
+func missingUint64IDs(requested []uint64, existing []uint64) []uint64 {
+	existingSet := make(map[uint64]struct{}, len(existing))
+	for _, id := range existing {
+		existingSet[id] = struct{}{}
+	}
+	missing := make([]uint64, 0)
+	for _, id := range requested {
+		if _, ok := existingSet[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
+func authContentForResponse(content datatypes.JSON) any {
+	if len(content) == 0 {
+		return content
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil || payload == nil {
+		return content
+	}
+	return redactKiroAuthPayload(payload)
+}
+
+func redactKiroAuthPayload(payload map[string]any) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	out := make(map[string]any, len(payload))
+	for key, value := range payload {
+		out[key] = value
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(stringValue(out["provider"])))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(stringValue(out["type"])))
+	}
+	if metadata, ok := out["metadata"].(map[string]any); ok {
+		metadataProvider := strings.ToLower(strings.TrimSpace(stringValue(metadata["provider"])))
+		if metadataProvider == "" {
+			metadataProvider = strings.ToLower(strings.TrimSpace(stringValue(metadata["type"])))
+		}
+		if metadataProvider == cliproxyauth.KiroProvider {
+			out["metadata"] = cliproxyauth.RedactKiroMetadata(metadata)
+		}
+		if provider == "" {
+			provider = metadataProvider
+		}
+	}
+	if provider == cliproxyauth.KiroProvider {
+		out = cliproxyauth.RedactKiroMetadata(out)
+	}
+	return out
+}
+
+func exportAuthFileName(key string) string {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return "auth.json"
+	}
+	trimmed = strings.TrimLeft(strings.ReplaceAll(trimmed, "\\", "/"), "/")
+	if !strings.HasSuffix(strings.ToLower(trimmed), ".json") {
+		trimmed += ".json"
+	}
+	return trimmed
+}
+
+func authGroupIDsFromPayload(payload map[string]any) (models.AuthGroupIDs, bool) {
+	for _, key := range []string{"authGroupIds", "auth_group_id"} {
+		rawValue, okValue := payload[key]
+		if !okValue {
+			continue
+		}
+		ids, okIDs := authGroupIDsFromAny(rawValue)
+		return ids, okIDs
+	}
+	return nil, false
+}
+
+func authGroupIDsFromAny(value any) (models.AuthGroupIDs, bool) {
+	switch typed := value.(type) {
+	case []any:
+		values := make([]uint64, 0, len(typed))
+		for _, item := range typed {
+			if parsed, okParsed := uint64Value(item); okParsed {
+				values = append(values, parsed)
+			}
+		}
+		return authGroupIDsFromValues(values), true
+	case []uint64:
+		return authGroupIDsFromValues(typed), true
+	case json.Number:
+		parsed, errParse := strconv.ParseUint(typed.String(), 10, 64)
+		if errParse != nil {
+			return models.AuthGroupIDs{}, false
+		}
+		return authGroupIDsFromValues([]uint64{parsed}), true
+	case float64:
+		if typed <= 0 {
+			return models.AuthGroupIDs{}, true
+		}
+		return authGroupIDsFromValues([]uint64{uint64(typed)}), true
+	case string:
+		ids, errParse := parseAuthGroupIDsInput(typed)
+		return ids, errParse == nil
+	default:
+		return models.AuthGroupIDs{}, false
+	}
+}
+
 func authGroupIDsFromValues(values []uint64) models.AuthGroupIDs {
 	if len(values) == 0 {
 		return models.AuthGroupIDs{}
@@ -597,6 +1074,103 @@ func authGroupIDsFromValues(values []uint64) models.AuthGroupIDs {
 		return models.AuthGroupIDs{}
 	}
 	return out
+}
+
+func stringValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		return ""
+	}
+}
+
+func boolField(payload map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		rawValue, okValue := payload[key]
+		if !okValue {
+			continue
+		}
+		switch typed := rawValue.(type) {
+		case bool:
+			return typed, true
+		case string:
+			parsed, errParse := strconv.ParseBool(strings.TrimSpace(typed))
+			if errParse == nil {
+				return parsed, true
+			}
+		}
+	}
+	return false, false
+}
+
+func intField(payload map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		rawValue, okValue := payload[key]
+		if !okValue {
+			continue
+		}
+		if parsed, okParsed := intValue(rawValue); okParsed {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func intValue(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case uint64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		parsed, errParse := strconv.ParseInt(typed.String(), 10, 64)
+		if errParse == nil {
+			return int(parsed), true
+		}
+	case string:
+		parsed, errParse := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		if errParse == nil {
+			return int(parsed), true
+		}
+	}
+	return 0, false
+}
+
+func uint64Value(value any) (uint64, bool) {
+	switch typed := value.(type) {
+	case uint64:
+		return typed, true
+	case int:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case int64:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case float64:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case json.Number:
+		parsed, errParse := strconv.ParseUint(typed.String(), 10, 64)
+		return parsed, errParse == nil
+	case string:
+		parsed, errParse := strconv.ParseUint(strings.TrimSpace(typed), 10, 64)
+		return parsed, errParse == nil
+	default:
+		return 0, false
+	}
 }
 
 func loadAuthGroupMap(ctx context.Context, db *gorm.DB, rows []models.Auth) (map[uint64]models.AuthGroup, error) {

@@ -129,13 +129,12 @@ type dbWatcher struct {
 	queue   reflect.Value
 	encoder *updateEncoder
 
-	dispatchMu     sync.Mutex
-	dispatchCond   *sync.Cond
-	pending        map[string]authUpdate
-	pendingOrder   []string
-	dispatchCtx    context.Context
-	dispatchCancel context.CancelFunc
-	wg             sync.WaitGroup
+	dispatchMu   sync.Mutex
+	dispatchCond *sync.Cond
+	pending      map[string]authUpdate
+	pendingOrder []string
+	dispatchStop chan struct{}
+	wg           sync.WaitGroup
 }
 
 // NewDatabaseWatcherFactory builds a watcher factory backed by database polling.
@@ -165,12 +164,13 @@ func (w *dbWatcher) Start(ctx context.Context) error {
 	}
 
 	w.dispatchMu.Lock()
-	if w.dispatchCancel == nil {
-		w.dispatchCtx, w.dispatchCancel = context.WithCancel(context.Background())
+	if w.dispatchStop == nil {
+		w.dispatchStop = make(chan struct{})
+		dispatchStop := w.dispatchStop
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
-			w.dispatchLoop(w.dispatchCtx)
+			w.dispatchLoop(dispatchStop)
 		}()
 	}
 	w.dispatchMu.Unlock()
@@ -191,9 +191,9 @@ func (w *dbWatcher) Stop() error {
 		return nil
 	}
 	w.dispatchMu.Lock()
-	if w.dispatchCancel != nil {
-		w.dispatchCancel()
-		w.dispatchCancel = nil
+	if w.dispatchStop != nil {
+		close(w.dispatchStop)
+		w.dispatchStop = nil
 	}
 	if w.dispatchCond != nil {
 		w.dispatchCond.Broadcast()
@@ -533,7 +533,7 @@ func (w *dbWatcher) pollAuth(ctx context.Context, force bool) {
 
 	var rows []models.Auth
 	if errFind := w.db.WithContext(qctx).
-		Select("key", "content", "priority", "created_at", "updated_at").
+		Select("key", "proxy_url", "content", "priority", "created_at", "updated_at").
 		Where("is_available = ?", true).
 		Order("id ASC").
 		Find(&rows).Error; errFind != nil {
@@ -556,7 +556,7 @@ func (w *dbWatcher) pollAuth(ctx context.Context, force bool) {
 		hash := hashBytes(row.Content)
 		nextStates[key] = authState{hash: hash, updatedAt: row.UpdatedAt}
 
-		a := synthesizeAuthFromDBRow(w.authDir, key, row.Content, row.Priority, row.CreatedAt, row.UpdatedAt)
+		a := synthesizeAuthFromDBRow(w.authDir, key, row.ProxyURL, row.Content, row.Priority, row.CreatedAt, row.UpdatedAt)
 		if a == nil || a.ID == "" {
 			continue
 		}
@@ -1070,18 +1070,18 @@ func (w *dbWatcher) enqueueUpdate(update authUpdate) {
 	w.dispatchMu.Unlock()
 }
 
-// dispatchLoop sends queued updates to the configured channel until canceled.
-func (w *dbWatcher) dispatchLoop(ctx context.Context) {
+// dispatchLoop sends queued updates to the configured channel until stopped.
+func (w *dbWatcher) dispatchLoop(stop <-chan struct{}) {
 	for {
 		queue, encoder := w.queueSnapshot()
 		if !queue.IsValid() || encoder == nil {
-			if ctx.Err() != nil {
+			if dispatchStopped(stop) {
 				return
 			}
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		batch, ok := w.nextBatch(ctx)
+		batch, ok := w.nextBatch(stop)
 		if !ok {
 			return
 		}
@@ -1099,15 +1099,15 @@ func (w *dbWatcher) dispatchLoop(ctx context.Context) {
 }
 
 // nextBatch waits for pending updates and returns the next batch.
-func (w *dbWatcher) nextBatch(ctx context.Context) ([]authUpdate, bool) {
+func (w *dbWatcher) nextBatch(stop <-chan struct{}) ([]authUpdate, bool) {
 	w.dispatchMu.Lock()
 	defer w.dispatchMu.Unlock()
 	for len(w.pendingOrder) == 0 {
-		if ctx.Err() != nil {
+		if dispatchStopped(stop) {
 			return nil, false
 		}
 		w.dispatchCond.Wait()
-		if ctx.Err() != nil {
+		if dispatchStopped(stop) {
 			return nil, false
 		}
 	}
@@ -1118,6 +1118,18 @@ func (w *dbWatcher) nextBatch(ctx context.Context) ([]authUpdate, bool) {
 	}
 	w.pendingOrder = w.pendingOrder[:0]
 	return out, true
+}
+
+func dispatchStopped(stop <-chan struct{}) bool {
+	if stop == nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // queueSnapshot returns the current queue and encoder under lock.
@@ -1170,7 +1182,7 @@ func encodeUpdate(enc *updateEncoder, update authUpdate) (reflect.Value, bool) {
 }
 
 // synthesizeAuthFromDBRow builds an auth entry from the stored JSON payload.
-func synthesizeAuthFromDBRow(authDir string, key string, payload []byte, priority int, createdAt, updatedAt time.Time) *coreauth.Auth {
+func synthesizeAuthFromDBRow(authDir string, key string, rowProxyURL string, payload []byte, priority int, createdAt, updatedAt time.Time) *coreauth.Auth {
 	var metadata map[string]any
 	if errUnmarshal := json.Unmarshal(payload, &metadata); errUnmarshal != nil {
 		return nil
@@ -1186,13 +1198,18 @@ func synthesizeAuthFromDBRow(authDir string, key string, payload []byte, priorit
 	}
 
 	label := provider
+	if displayLabel, _ := metadata["label"].(string); strings.TrimSpace(displayLabel) != "" {
+		label = strings.TrimSpace(displayLabel)
+	}
 	if email, _ := metadata["email"].(string); strings.TrimSpace(email) != "" {
 		label = strings.TrimSpace(email)
 	}
 
-	proxyURL := ""
+	proxyURL := strings.TrimSpace(rowProxyURL)
 	if v, ok := metadata["proxy_url"].(string); ok {
-		proxyURL = strings.TrimSpace(v)
+		if proxyURL == "" {
+			proxyURL = strings.TrimSpace(v)
+		}
 	}
 
 	prefix := ""

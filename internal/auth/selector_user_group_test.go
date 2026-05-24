@@ -93,6 +93,82 @@ func TestSelectorEnforcesModelMappingUserGroupRestriction(t *testing.T) {
 	_, _ = ginCtx, conn
 }
 
+func TestSelectorEnforcesKiroModelMappingUserGroupRestriction(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	conn, errOpen := db.Open(":memory:")
+	if errOpen != nil {
+		t.Fatalf("open db: %v", errOpen)
+	}
+	if errMigrate := db.Migrate(conn); errMigrate != nil {
+		t.Fatalf("migrate db: %v", errMigrate)
+	}
+
+	now := time.Now().UTC()
+	groupAllowed := models.UserGroup{Name: "kiro-allowed", CreatedAt: now, UpdatedAt: now}
+	groupDenied := models.UserGroup{Name: "kiro-denied", CreatedAt: now, UpdatedAt: now}
+	if errCreate := conn.Create(&groupAllowed).Error; errCreate != nil {
+		t.Fatalf("create allowed group: %v", errCreate)
+	}
+	if errCreate := conn.Create(&groupDenied).Error; errCreate != nil {
+		t.Fatalf("create denied group: %v", errCreate)
+	}
+
+	user := models.User{
+		Username:    "kiro-user",
+		Password:    "hashed",
+		UserGroupID: models.UserGroupIDs{&groupAllowed.ID},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if errCreate := conn.Create(&user).Error; errCreate != nil {
+		t.Fatalf("create user: %v", errCreate)
+	}
+
+	authGroup := models.AuthGroup{Name: "kiro-ag", CreatedAt: now, UpdatedAt: now}
+	if errCreate := conn.Create(&authGroup).Error; errCreate != nil {
+		t.Fatalf("create auth group: %v", errCreate)
+	}
+	authRecord := models.Auth{
+		Key:         "kiro-auth-1",
+		AuthGroupID: models.AuthGroupIDs{&authGroup.ID},
+		Content:     datatypes.JSON([]byte(`{"type":"kiro","label":"Kiro","refresh_token":"refresh","region":"us-east-1"}`)),
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if errCreate := conn.Create(&authRecord).Error; errCreate != nil {
+		t.Fatalf("create auth record: %v", errCreate)
+	}
+
+	mapping := models.ModelMapping{
+		Provider:     "kiro",
+		ModelName:    "claude-sonnet-4.5",
+		NewModelName: "claude-sonnet-4.5-thinking-agentic",
+		Selector:     0,
+		RateLimit:    0,
+		IsEnabled:    true,
+		UserGroupID:  models.UserGroupIDs{&groupDenied.ID},
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if errCreate := conn.Create(&mapping).Error; errCreate != nil {
+		t.Fatalf("create model mapping: %v", errCreate)
+	}
+	modelmapping.StoreModelMappings(now, []models.ModelMapping{mapping})
+	t.Cleanup(func() { modelmapping.StoreModelMappings(time.Now().UTC(), nil) })
+
+	selector := NewSelector(conn)
+	selector.rateLimiter = nil
+	selector.resolveRateLimit = nil
+
+	ctx, ginCtx := buildTestGinContext("/v1/chat/completions", user.ID)
+	auths := []*coreauth.Auth{{ID: authRecord.Key, Status: coreauth.StatusActive}}
+	if _, errPick := selector.Pick(ctx, "kiro", "claude-sonnet-4.5-thinking-agentic", cliproxyexecutor.Options{}, auths); errPick == nil {
+		t.Fatalf("expected Kiro pick blocked by model mapping restriction, got nil")
+	}
+
+	_, _ = ginCtx, conn
+}
+
 func TestSelectorFiltersAuthsByAuthGroupUserGroupRestriction(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	conn, errOpen := db.Open(":memory:")

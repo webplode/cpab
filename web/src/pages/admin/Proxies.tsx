@@ -12,6 +12,11 @@ import { useTranslation } from 'react-i18next';
 interface ProxyItem {
     id: number;
     proxy_url: string;
+    is_active?: boolean;
+    test_status?: string;
+    last_tested_at?: string | null;
+    last_error?: string;
+    last_checked_ip?: string;
     created_at: string;
     updated_at: string;
 }
@@ -19,6 +24,30 @@ interface ProxyItem {
 interface ListResponse {
     proxies: ProxyItem[];
 }
+
+interface BatchDeleteResponse {
+    deleted: number;
+    missing_ids?: number[];
+}
+
+interface ProxyCheckResponse {
+    live: boolean;
+    ip: string;
+    service: string;
+    target_url: string;
+    latency_ms: number;
+    checked_at: string;
+    status_code?: number;
+    error?: string;
+    failure_stage?: string;
+    diagnosis?: string;
+    hint?: string;
+    suggested_proxy_url?: string;
+}
+
+type ProxyCheckState = ProxyCheckResponse & {
+    status: 'checking' | 'live' | 'dead';
+};
 
 interface ProxyFormData {
     protocol: string;
@@ -195,8 +224,11 @@ function ProxyModal({ title, initialData, submitting, onClose, onSubmit }: Proxy
                                     onClose={() => setMenuOpen(false)}
                                 />
                             )}
-                        </div>
-                    </div>
+                          </div>
+                          <p className="mt-1.5 text-xs text-slate-500 dark:text-text-secondary">
+                              {t('Use http for most proxies labeled HTTPS; choose https only when the proxy server itself requires TLS.')}
+                          </p>
+                      </div>
                     <div>
                         <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
                             {t('Host')}
@@ -396,6 +428,42 @@ function buildProxyUrl(data: ProxyFormData): string {
     return `${protocol}://${authPart}${host}:${port}/`;
 }
 
+function proxyCheckStateFromRow(proxy: ProxyItem): ProxyCheckState | null {
+    const status = proxy.test_status || 'new';
+    const checkedAt = proxy.last_tested_at || proxy.updated_at;
+
+    if (status === 'active') {
+        return {
+            status: 'live',
+            live: true,
+            ip: proxy.last_checked_ip || '',
+            service: '',
+            target_url: '',
+            latency_ms: 0,
+            checked_at: checkedAt,
+        };
+    }
+
+    if (status === 'error' || proxy.is_active === false) {
+        return {
+            status: 'dead',
+            live: false,
+            ip: '',
+            service: '',
+            target_url: '',
+            latency_ms: 0,
+            checked_at: checkedAt,
+            error: proxy.last_error || '',
+        };
+    }
+
+    return null;
+}
+
+function getErrorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : 'Proxy check failed';
+}
+
 export function AdminProxies() {
     const { t, i18n } = useTranslation();
     const { hasPermission } = useAdminPermissions();
@@ -404,10 +472,14 @@ export function AdminProxies() {
     const canListProxies = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/proxies'));
     const canCreateProxies = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/proxies'));
     const canBatchCreateProxies = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/proxies/batch'));
+    const canBatchDeleteProxies = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/proxies/batch-delete'));
+    const canCheckProxies = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/proxies/:id/check'));
     const canUpdateProxies = hasPermission(buildAdminPermissionKey('PUT', '/v0/admin/proxies/:id'));
     const canDeleteProxies = hasPermission(buildAdminPermissionKey('DELETE', '/v0/admin/proxies/:id'));
 
     const [proxies, setProxies] = useState<ProxyItem[]>([]);
+    const [proxyChecks, setProxyChecks] = useState<Record<number, ProxyCheckState>>({});
+    const [selectedProxyIds, setSelectedProxyIds] = useState<number[]>([]);
     const [loading, setLoading] = useState(false);
     const [search, setSearch] = useState('');
     const [currentPage, setCurrentPage] = useState(1);
@@ -416,7 +488,11 @@ export function AdminProxies() {
     const [bulkOpen, setBulkOpen] = useState(false);
     const [submitting, setSubmitting] = useState(false);
     const [bulkSubmitting, setBulkSubmitting] = useState(false);
+    const [batchDeleteSubmitting, setBatchDeleteSubmitting] = useState(false);
+    const [toast, setToast] = useState<{ show: boolean; message: string }>({ show: false, message: '' });
     const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+    const selectPageCheckboxRef = useRef<HTMLInputElement>(null);
+    const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const fetchProxies = useCallback(async () => {
         if (!canListProxies) {
@@ -451,13 +527,55 @@ export function AdminProxies() {
         const start = (currentPage - 1) * PAGE_SIZE;
         return proxies.slice(start, start + PAGE_SIZE);
     }, [proxies, currentPage]);
+    const selectedProxySet = useMemo(() => new Set(selectedProxyIds), [selectedProxyIds]);
+    const selectedProxies = useMemo(
+        () => proxies.filter((proxy) => selectedProxySet.has(proxy.id)),
+        [proxies, selectedProxySet]
+    );
+    const pageProxyIds = useMemo(
+        () => paginatedProxies.map((proxy) => proxy.id),
+        [paginatedProxies]
+    );
+    const selectedPageCount = pageProxyIds.filter((id) => selectedProxySet.has(id)).length;
+    const allPageSelected = pageProxyIds.length > 0 && selectedPageCount === pageProxyIds.length;
+    const somePageSelected = selectedPageCount > 0 && !allPageSelected;
+    const canSelectProxies = canCheckProxies || canBatchDeleteProxies;
 
     const { tableScrollRef, handleTableScroll, showActionsDivider } = useStickyActionsDivider(
         paginatedProxies.length,
         loading
     );
 
+    useEffect(() => {
+        const availableIds = new Set(proxies.map((proxy) => proxy.id));
+        setSelectedProxyIds((prev) => prev.filter((id) => availableIds.has(id)));
+    }, [proxies]);
+
+    useEffect(() => {
+        if (selectPageCheckboxRef.current) {
+            selectPageCheckboxRef.current.indeterminate = somePageSelected;
+        }
+    }, [somePageSelected]);
+
     const formatDate = (value: string) => new Date(value).toLocaleString(locale);
+
+    const showToast = useCallback((message: string) => {
+        if (toastTimeoutRef.current) {
+            clearTimeout(toastTimeoutRef.current);
+        }
+        setToast({ show: true, message });
+        toastTimeoutRef.current = setTimeout(() => {
+            setToast({ show: false, message: '' });
+        }, 10000);
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (toastTimeoutRef.current) {
+                clearTimeout(toastTimeoutRef.current);
+            }
+        };
+    }, []);
 
     const handleSave = async (payload: ProxyFormData) => {
         if (!canCreateProxies && !canUpdateProxies) {
@@ -506,6 +624,150 @@ export function AdminProxies() {
         }
     };
 
+    const handleToggleProxySelection = (proxyId: number, checked: boolean) => {
+        setSelectedProxyIds((prev) => {
+            if (checked) {
+                if (prev.includes(proxyId)) {
+                    return prev;
+                }
+                return [...prev, proxyId];
+            }
+            return prev.filter((id) => id !== proxyId);
+        });
+    };
+
+    const handleTogglePageSelection = (checked: boolean) => {
+        setSelectedProxyIds((prev) => {
+            if (checked) {
+                const next = new Set(prev);
+                for (const id of pageProxyIds) {
+                    next.add(id);
+                }
+                return Array.from(next);
+            }
+            const pageIds = new Set(pageProxyIds);
+            return prev.filter((id) => !pageIds.has(id));
+        });
+    };
+
+    const handleClearSelection = () => {
+        setSelectedProxyIds([]);
+    };
+
+    const handleCheckProxy = async (proxy: ProxyItem) => {
+        if (!canCheckProxies) {
+            return;
+        }
+
+        setProxyChecks((prev) => ({
+            ...prev,
+            [proxy.id]: {
+                status: 'checking',
+                live: false,
+                ip: '',
+                service: '4.ident.me',
+                target_url: 'https://4.ident.me/',
+                latency_ms: 0,
+                checked_at: new Date().toISOString(),
+            },
+        }));
+
+        try {
+            const result = await apiFetchAdmin<ProxyCheckResponse>(`/v0/admin/proxies/${proxy.id}/check`, {
+                method: 'POST',
+            });
+            setProxyChecks((prev) => ({
+                ...prev,
+                [proxy.id]: {
+                    ...result,
+                    status: result.live ? 'live' : 'dead',
+                },
+            }));
+            setProxies((prev) =>
+                prev.map((item) =>
+                    item.id === proxy.id
+                        ? {
+                              ...item,
+                              is_active: result.live,
+                              test_status: result.live ? 'active' : 'error',
+                              last_tested_at: result.checked_at,
+                              last_error: result.error || '',
+                              last_checked_ip: result.ip || '',
+                          }
+                        : item
+                )
+            );
+        } catch (err) {
+            setProxyChecks((prev) => ({
+                ...prev,
+                [proxy.id]: {
+                    status: 'dead',
+                    live: false,
+                    ip: '',
+                    service: '4.ident.me',
+                    target_url: 'https://4.ident.me/',
+                    latency_ms: 0,
+                    checked_at: new Date().toISOString(),
+                    error: getErrorMessage(err),
+                },
+            }));
+        }
+    };
+
+    const handleCheckSelectedProxies = async () => {
+        if (!canCheckProxies || selectedProxies.length === 0) {
+            return;
+        }
+        const concurrency = 10;
+        for (let index = 0; index < selectedProxies.length; index += concurrency) {
+            const batch = selectedProxies.slice(index, index + concurrency);
+            await Promise.all(batch.map((proxy) => handleCheckProxy(proxy)));
+        }
+    };
+
+    const handleBatchDelete = () => {
+        if (!canBatchDeleteProxies || selectedProxies.length === 0 || batchDeleteSubmitting) {
+            return;
+        }
+        const ids = selectedProxies.map((proxy) => proxy.id);
+        setConfirmDialog({
+            title: t('Delete Selected Proxies'),
+            message: t('Are you sure you want to delete {{count}} selected proxies? This action cannot be undone.', {
+                count: ids.length,
+            }),
+            confirmText: t('Delete'),
+            danger: true,
+            onConfirm: async () => {
+                setBatchDeleteSubmitting(true);
+                try {
+                    const result = await apiFetchAdmin<BatchDeleteResponse>('/v0/admin/proxies/batch-delete', {
+                        method: 'POST',
+                        body: JSON.stringify({ ids }),
+                    });
+                    setSelectedProxyIds((prev) => prev.filter((id) => !ids.includes(id)));
+                    await fetchProxies();
+                    const missingCount = result.missing_ids?.length || 0;
+                    if (missingCount > 0) {
+                        showToast(
+                            t('Deleted {{deleted}} proxies. {{missing}} selected proxies were already missing.', {
+                                deleted: result.deleted,
+                                missing: missingCount,
+                            })
+                        );
+                    } else {
+                        showToast(t('Deleted {{count}} proxies', { count: result.deleted }));
+                    }
+                } catch (err) {
+                    console.error('Failed to delete selected proxies:', err);
+                    showToast(err instanceof Error ? err.message : t('Failed to delete selected proxies.'));
+                } finally {
+                    setBatchDeleteSubmitting(false);
+                    setConfirmDialog(null);
+                }
+            },
+        });
+    };
+
     const handleDelete = (proxy: ProxyItem) => {
         if (!canDeleteProxies) {
             return;
@@ -528,6 +790,97 @@ export function AdminProxies() {
         });
     };
 
+    const renderCheckStatus = (proxy: ProxyItem) => {
+        if (!canCheckProxies) {
+            return (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 dark:border-border-dark px-2.5 py-1 text-xs font-medium text-slate-500 dark:text-text-secondary whitespace-nowrap">
+                    <Icon name="lock" size={16} />
+                    {t('No check access')}
+                </span>
+            );
+        }
+
+        const check = proxyChecks[proxy.id] || proxyCheckStateFromRow(proxy);
+        if (!check) {
+            return (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 dark:border-border-dark px-2.5 py-1 text-xs font-medium text-slate-500 dark:text-text-secondary whitespace-nowrap">
+                    <Icon name="help" size={16} />
+                    {t('Not checked')}
+                </span>
+            );
+        }
+
+        if (check.status === 'checking') {
+            return (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/20 px-2.5 py-1 text-xs font-medium text-blue-700 dark:text-blue-300 whitespace-nowrap">
+                    <Icon name="sync" size={16} className="animate-spin" />
+                    {t('Checking...')}
+                </span>
+            );
+        }
+
+        if (check.status === 'live') {
+            return (
+                <div className="space-y-1">
+                    <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-900/20 px-2.5 py-1 text-xs font-semibold text-emerald-700 dark:text-emerald-300 whitespace-nowrap">
+                        <Icon name="check_circle" size={16} />
+                        {t('LIVE')}
+                    </span>
+                    {check.ip ? (
+                        <div className="font-mono text-xs text-slate-700 dark:text-gray-300">
+                            {check.ip}
+                        </div>
+                    ) : null}
+                    {check.service ? (
+                        <div className="text-xs text-slate-500 dark:text-text-secondary whitespace-nowrap">
+                            {t('{{ms}} ms via {{service}}', {
+                                ms: check.latency_ms,
+                                service: check.service,
+                            })}
+                        </div>
+                    ) : null}
+                </div>
+            );
+        }
+
+        const detailTitle = [check.diagnosis, check.error, check.hint, check.suggested_proxy_url]
+            .filter(Boolean)
+            .join('\n');
+
+        return (
+            <div className="space-y-1">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/20 px-2.5 py-1 text-xs font-semibold text-red-700 dark:text-red-300 whitespace-nowrap">
+                    <Icon name="error" size={16} />
+                    {t('OFFLINE')}
+                </span>
+                {check.diagnosis && (
+                    <div className="max-w-80 text-xs font-medium text-slate-700 dark:text-gray-300" title={detailTitle}>
+                        {check.diagnosis}
+                    </div>
+                )}
+                {check.error && (
+                    <div className="max-w-80 truncate text-xs text-slate-500 dark:text-text-secondary" title={detailTitle || check.error}>
+                        {check.error}
+                    </div>
+                )}
+                {check.hint && (
+                    <div className="max-w-80 text-xs text-amber-700 dark:text-amber-300" title={detailTitle}>
+                        {check.hint}
+                    </div>
+                )}
+                {check.suggested_proxy_url && (
+                    <div className="max-w-80 truncate font-mono text-xs text-slate-600 dark:text-gray-300" title={check.suggested_proxy_url}>
+                        {t('Suggested URL: {{url}}', { url: check.suggested_proxy_url })}
+                    </div>
+                )}
+            </div>
+        );
+      };
+
+    const selectedCheckInProgress = selectedProxies.some(
+        (proxy) => proxyChecks[proxy.id]?.status === 'checking'
+    );
+
     if (!canListProxies) {
         return (
             <AdminDashboardLayout title={t('Proxies')} subtitle={t('Manage proxy endpoints for upstream requests.')}>
@@ -539,26 +892,59 @@ export function AdminProxies() {
     return (
         <AdminDashboardLayout title={t('Proxies')} subtitle={t('Manage proxy endpoints for upstream requests.')}>
             <div className="space-y-6">
-                {(canCreateProxies || canBatchCreateProxies) && (
-                    <div className="flex justify-end gap-2">
-                        {canBatchCreateProxies && (
-                            <button
-                                onClick={() => setBulkOpen(true)}
-                                className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium border border-gray-200 dark:border-border-dark"
-                            >
-                                <Icon name="library_add" size={18} />
-                                {t('Batch Add')}
-                            </button>
-                        )}
-                        {canCreateProxies && (
-                            <button
-                                onClick={() => setCreateOpen(true)}
-                                className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
-                            >
-                                <Icon name="add" size={18} />
-                                {t('New Proxy')}
-                            </button>
-                        )}
+                {(canCheckProxies || canBatchDeleteProxies || canCreateProxies || canBatchCreateProxies) && (
+                    <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div className="flex flex-wrap items-center gap-2">
+                            {canCheckProxies && (
+                                <button
+                                    onClick={handleCheckSelectedProxies}
+                                    disabled={selectedProxies.length === 0 || selectedCheckInProgress}
+                                    className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <Icon name="network_check" size={18} />
+                                    {t('Check Selected ({{count}})', { count: selectedProxies.length })}
+                                </button>
+                            )}
+                            {canBatchDeleteProxies && (
+                                <button
+                                    onClick={handleBatchDelete}
+                                    disabled={selectedProxies.length === 0 || batchDeleteSubmitting}
+                                    className="flex items-center gap-2 px-4 py-2 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors font-medium border border-red-200 dark:border-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <Icon name="delete" size={18} />
+                                    {batchDeleteSubmitting ? t('Deleting...') : t('Delete Selected')}
+                                </button>
+                            )}
+                            {selectedProxies.length > 0 && (
+                                <button
+                                    onClick={handleClearSelection}
+                                    className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium border border-gray-200 dark:border-border-dark"
+                                >
+                                    <Icon name="close" size={18} />
+                                    {t('Clear Selection')}
+                                </button>
+                            )}
+                        </div>
+                        <div className="flex justify-end gap-2">
+                            {canBatchCreateProxies && (
+                                <button
+                                    onClick={() => setBulkOpen(true)}
+                                    className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium border border-gray-200 dark:border-border-dark"
+                                >
+                                    <Icon name="library_add" size={18} />
+                                    {t('Batch Add')}
+                                </button>
+                            )}
+                            {canCreateProxies && (
+                                <button
+                                    onClick={() => setCreateOpen(true)}
+                                    className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
+                                >
+                                    <Icon name="add" size={18} />
+                                    {t('New Proxy')}
+                                </button>
+                            )}
+                        </div>
                     </div>
                 )}
 
@@ -591,8 +977,20 @@ export function AdminProxies() {
                         <table className="w-full text-sm text-left text-gray-500 dark:text-gray-400">
                             <thead className="text-xs text-gray-700 uppercase bg-gray-50 dark:bg-surface-dark dark:text-gray-400 border-b border-gray-200 dark:border-border-dark">
                                 <tr>
+                                    <th className="px-6 py-4 font-semibold tracking-wider">
+                                            <input
+                                                ref={selectPageCheckboxRef}
+                                                type="checkbox"
+                                                checked={allPageSelected}
+                                                disabled={!canSelectProxies || pageProxyIds.length === 0}
+                                            onChange={(e) => handleTogglePageSelection(e.target.checked)}
+                                            aria-label={t('Select visible proxies')}
+                                            className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-dark dark:bg-background-dark"
+                                        />
+                                    </th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('ID')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Proxy URL')}</th>
+                                    <th className="px-6 py-4 font-semibold tracking-wider">{t('Live Check')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Created At')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Updated At')}</th>
                                     <th
@@ -607,13 +1005,13 @@ export function AdminProxies() {
                             <tbody className="divide-y divide-gray-200 dark:divide-border-dark">
                                 {loading ? (
                                     <tr>
-                                        <td colSpan={5} className="px-6 py-12 text-center">
+                                        <td colSpan={7} className="px-6 py-12 text-center">
                                             {t('Loading...')}
                                         </td>
                                     </tr>
                                 ) : paginatedProxies.length === 0 ? (
                                     <tr>
-                                        <td colSpan={5} className="px-6 py-12 text-center">
+                                        <td colSpan={7} className="px-6 py-12 text-center">
                                             {t('No proxies found')}
                                         </td>
                                     </tr>
@@ -623,11 +1021,24 @@ export function AdminProxies() {
                                             key={proxy.id}
                                             className="hover:bg-gray-50 dark:hover:bg-background-dark group"
                                         >
+                                            <td className="px-6 py-4">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedProxySet.has(proxy.id)}
+                                                    disabled={!canSelectProxies}
+                                                    onChange={(e) => handleToggleProxySelection(proxy.id, e.target.checked)}
+                                                    aria-label={t('Select proxy {{id}}', { id: proxy.id })}
+                                                    className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-dark dark:bg-background-dark"
+                                                />
+                                            </td>
                                             <td className="px-6 py-4 text-slate-900 dark:text-white font-medium">
                                                 {proxy.id}
                                             </td>
                                             <td className="px-6 py-4 text-slate-700 dark:text-gray-300 font-mono text-xs">
                                                 {proxy.proxy_url}
+                                            </td>
+                                            <td className="px-6 py-4 min-w-48">
+                                                {renderCheckStatus(proxy)}
                                             </td>
                                             <td className="px-6 py-4 font-mono text-xs">
                                                 {formatDate(proxy.created_at)}
@@ -641,6 +1052,16 @@ export function AdminProxies() {
                                                 }`}
                                             >
                                                 <div className="flex items-center justify-center gap-1">
+                                                    {canCheckProxies && (
+                                                        <button
+                                                            onClick={() => handleCheckProxy(proxy)}
+                                                            disabled={proxyChecks[proxy.id]?.status === 'checking'}
+                                                            className="p-2 text-gray-400 hover:text-emerald-600 hover:bg-gray-100 dark:hover:bg-background-dark rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                            title={t('Check Proxy')}
+                                                        >
+                                                            <Icon name="network_check" size={18} />
+                                                        </button>
+                                                    )}
                                                     {canUpdateProxies && (
                                                         <button
                                                             onClick={() => setEditingProxy(proxy)}
@@ -731,6 +1152,23 @@ export function AdminProxies() {
                     onConfirm={confirmDialog.onConfirm}
                     onCancel={() => setConfirmDialog(null)}
                 />
+            )}
+
+            {toast.show && (
+                <div className="fixed top-4 right-4 z-[9999] animate-slide-in-right">
+                    <div className="flex items-center gap-3 px-4 py-3 bg-emerald-50 dark:bg-emerald-900 border border-emerald-200 dark:border-emerald-800 rounded-lg shadow-lg">
+                        <Icon name="check_circle" size={20} className="text-emerald-500" />
+                        <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
+                            {toast.message}
+                        </span>
+                        <button
+                            onClick={() => setToast({ show: false, message: '' })}
+                            className="inline-flex h-7 w-7 items-center justify-center text-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-300 rounded transition-colors"
+                        >
+                            <Icon name="close" size={16} />
+                        </button>
+                    </div>
+                </div>
             )}
         </AdminDashboardLayout>
     );

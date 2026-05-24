@@ -305,17 +305,46 @@ func filterModelInfosByUserGroups(raw []*sdkcliproxy.ModelInfo, userGroups, bill
 		if modelID == "" {
 			continue
 		}
-		provider := strings.ToLower(strings.TrimSpace(info.OwnedBy))
-		if provider != "" {
+		providers := modelInfoRestrictionProviders(info)
+		restricted := false
+		allowedForAnyProvider := false
+		for _, provider := range providers {
 			if allowed, okAllowed := modelmapping.LookupUserGroupIDs(provider, modelID); okAllowed && len(allowed.Clean()) > 0 {
+				restricted = true
 				if !hasAnyAllowedUserGroup(allowed, userGroups, billUserGroups) {
 					continue
 				}
+				allowedForAnyProvider = true
 			}
+		}
+		if restricted && !allowedForAnyProvider {
+			continue
 		}
 		filtered = append(filtered, info)
 	}
 	return filtered
+}
+
+func modelInfoRestrictionProviders(info *sdkcliproxy.ModelInfo) []string {
+	if info == nil {
+		return nil
+	}
+	out := make([]string, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	add := func(provider string) {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "" {
+			return
+		}
+		if _, ok := seen[provider]; ok {
+			return
+		}
+		seen[provider] = struct{}{}
+		out = append(out, provider)
+	}
+	add(info.OwnedBy)
+	add(info.Type)
+	return out
 }
 
 // normalizeRequestPath trims trailing slashes for route matching.

@@ -153,6 +153,9 @@ var definitions = []Definition{
 
 	newDefinition("POST", "/v0/admin/auth-files", "Create Auth File", "Auth Files"),
 	newDefinition("POST", "/v0/admin/auth-files/import", "Import Auth Files", "Auth Files"),
+	newDefinition("GET", "/v0/admin/auth-files/export", "Export Auth Files", "Auth Files"),
+	newDefinition("POST", "/v0/admin/auth-files/export", "Export Selected Auth Files", "Auth Files"),
+	newDefinition("POST", "/v0/admin/auth-files/batch-delete", "Batch Delete Auth Files", "Auth Files"),
 	newDefinition("GET", "/v0/admin/auth-files", "List Auth Files", "Auth Files"),
 	newDefinition("GET", "/v0/admin/auth-files/:id", "Get Auth File", "Auth Files"),
 	newDefinition("PUT", "/v0/admin/auth-files/:id", "Update Auth File", "Auth Files"),
@@ -167,6 +170,8 @@ var definitions = []Definition{
 	newDefinition("GET", "/v0/admin/model-mappings", "List Model Mappings", "Models"),
 	newDefinition("GET", "/v0/admin/model-mappings/available-models", "List Available Models", "Models"),
 	newDefinition("POST", "/v0/admin/model-mappings/refresh-supported-models", "Refresh Supported Models", "Models"),
+	newDefinition("POST", "/v0/admin/model-tests", "Test Model", "Models"),
+	newDefinition("POST", "/v0/admin/model-tests/batch", "Batch Test Models", "Models"),
 	newDefinition("GET", "/v0/admin/model-references/price", "Get Model Reference Price", "Models"),
 	newDefinition("GET", "/v0/admin/model-mappings/:id", "Get Model Mapping", "Models"),
 	newDefinition("PUT", "/v0/admin/model-mappings/:id", "Update Model Mapping", "Models"),
@@ -191,7 +196,9 @@ var definitions = []Definition{
 
 	newDefinition("POST", "/v0/admin/proxies", "Create Proxy", "Proxies"),
 	newDefinition("POST", "/v0/admin/proxies/batch", "Batch Create Proxies", "Proxies"),
+	newDefinition("POST", "/v0/admin/proxies/batch-delete", "Batch Delete Proxies", "Proxies"),
 	newDefinition("GET", "/v0/admin/proxies", "List Proxies", "Proxies"),
+	newDefinition("POST", "/v0/admin/proxies/:id/check", "Check Proxy", "Proxies"),
 	newDefinition("PUT", "/v0/admin/proxies/:id", "Update Proxy", "Proxies"),
 	newDefinition("DELETE", "/v0/admin/proxies/:id", "Delete Proxy", "Proxies"),
 

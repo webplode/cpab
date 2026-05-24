@@ -79,9 +79,20 @@ func (p *GormUsagePlugin) HandleUsage(ctx context.Context, record coreusage.Reco
 	}
 
 	provider := strings.TrimSpace(record.Provider)
-	model := strings.TrimSpace(record.Model)
-	if mappedModel, ok := modelmapping.LookupMappedModelName(provider, model); ok {
+	upstreamModel := strings.TrimSpace(record.Model)
+	requestedModel := strings.TrimSpace(record.Alias)
+	model := upstreamModel
+	if requestedModel != "" {
+		model = requestedModel
+	} else if mappedModel, ok := modelmapping.LookupMappedModelName(provider, upstreamModel); ok {
 		model = mappedModel
+		requestedModel = mappedModel
+	}
+	if requestedModel == "" {
+		requestedModel = model
+	}
+	if upstreamModel == "" {
+		upstreamModel = model
 	}
 
 	recordForBilling := record
@@ -96,6 +107,8 @@ func (p *GormUsagePlugin) HandleUsage(ctx context.Context, record coreusage.Reco
 	row := models.Usage{
 		Provider:        provider,
 		Model:           model,
+		RequestedModel:  requestedModel,
+		UpstreamModel:   upstreamModel,
 		UserID:          userID,
 		UserGroupID:     billingUserGroupID,
 		APIKeyID:        apiKeyID,

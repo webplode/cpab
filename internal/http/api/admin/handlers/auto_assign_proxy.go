@@ -26,6 +26,7 @@ func autoAssignProxyEnabled() bool {
 func pickRandomProxyURL(ctx context.Context, db *gorm.DB) (string, error) {
 	var row models.Proxy
 	if errFind := db.WithContext(ctx).
+		Where("is_active = ?", true).
 		Order(randomOrderExpr(db)).
 		Limit(1).
 		Take(&row).Error; errFind != nil {

@@ -57,14 +57,20 @@ type adminLogDetailQuery struct {
 
 // adminLogDetailEntry represents a single usage record in detail view.
 type adminLogDetailEntry struct {
-	RequestedAt  time.Time `json:"requested_at"`  // Request timestamp.
-	InputTokens  int64     `json:"input_tokens"`  // Input token count.
-	OutputTokens int64     `json:"output_tokens"` // Output token count.
-	CachedTokens int64     `json:"cached_tokens"` // Cached token count.
-	TotalTokens  int64     `json:"total_tokens"`  // Total token count.
-	CostMicros   int64     `json:"cost_micros"`   // Cost in micros.
-	Failed       bool      `json:"failed"`        // Failure flag.
-	Username     string    `json:"username"`      // Username.
+	RequestedAt     time.Time `json:"requested_at"`     // Request timestamp.
+	Model           string    `json:"model"`            // Billable/public model name.
+	RequestedModel  string    `json:"requested_model"`  // Client-requested model name.
+	UpstreamModel   string    `json:"upstream_model"`   // Upstream/base model name.
+	AuthKey         string    `json:"auth_key"`         // Selected auth key.
+	AuthIndex       string    `json:"auth_index"`       // Selected auth index.
+	InputTokens     int64     `json:"input_tokens"`     // Input token count.
+	OutputTokens    int64     `json:"output_tokens"`    // Output token count.
+	ReasoningTokens int64     `json:"reasoning_tokens"` // Reasoning token count.
+	CachedTokens    int64     `json:"cached_tokens"`    // Cached token count.
+	TotalTokens     int64     `json:"total_tokens"`     // Total token count.
+	CostMicros      int64     `json:"cost_micros"`      // Cost in micros.
+	Failed          bool      `json:"failed"`           // Failure flag.
+	Username        string    `json:"username"`         // Username.
 }
 
 // List returns aggregated usage logs with paging and filters.
@@ -206,8 +212,14 @@ func (h *AdminLogsHandler) Detail(c *gin.Context) {
 		Model(&models.Usage{}).
 		Select(`
 			requested_at,
+			model,
+			requested_model,
+			upstream_model,
+			auth_key,
+			auth_index,
 			input_tokens,
 			output_tokens,
+			reasoning_tokens,
 			cached_tokens,
 			total_tokens,
 			cost_micros,
@@ -238,14 +250,20 @@ func (h *AdminLogsHandler) Detail(c *gin.Context) {
 	details := make([]gin.H, 0, len(rows))
 	for _, row := range rows {
 		details = append(details, gin.H{
-			"requested_at":  row.RequestedAt.In(time.Local).Format(time.RFC3339),
-			"username":      row.Username,
-			"input_tokens":  row.InputTokens,
-			"output_tokens": row.OutputTokens,
-			"cached_tokens": row.CachedTokens,
-			"total_tokens":  row.TotalTokens,
-			"cost":          fmt.Sprintf("$%.4f", float64(row.CostMicros)/1_000_000),
-			"success":       !row.Failed,
+			"requested_at":     row.RequestedAt.In(time.Local).Format(time.RFC3339),
+			"username":         row.Username,
+			"model":            row.Model,
+			"requested_model":  row.RequestedModel,
+			"upstream_model":   row.UpstreamModel,
+			"auth_key":         row.AuthKey,
+			"auth_index":       row.AuthIndex,
+			"input_tokens":     row.InputTokens,
+			"output_tokens":    row.OutputTokens,
+			"reasoning_tokens": row.ReasoningTokens,
+			"cached_tokens":    row.CachedTokens,
+			"total_tokens":     row.TotalTokens,
+			"cost":             fmt.Sprintf("$%.4f", float64(row.CostMicros)/1_000_000),
+			"success":          !row.Failed,
 		})
 	}
 

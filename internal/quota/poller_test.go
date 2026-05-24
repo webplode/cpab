@@ -3,11 +3,13 @@ package quota
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/store"
 	"gorm.io/datatypes"
@@ -127,6 +129,106 @@ func TestMarkAuthNeedsReloginKeepsQuotaAndDisablesAuth(t *testing.T) {
 	}
 	if !disabledAuth.Disabled {
 		t.Fatalf("expected auth %s to be disabled in manager", authID)
+	}
+}
+
+type kiroPollTestExecutor struct {
+	refreshCalls int
+}
+
+func (e *kiroPollTestExecutor) Identifier() string { return "kiro" }
+
+func (e *kiroPollTestExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *kiroPollTestExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *kiroPollTestExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	e.refreshCalls++
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	updated.Metadata["access_token"] = "access-new"
+	updated.Metadata["refresh_token"] = "refresh-new"
+	updated.Metadata["expires_at"] = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	return updated, nil
+}
+
+func (e *kiroPollTestExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *kiroPollTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestPollRefreshesKiroAuthAndStoresHealthyStatus(t *testing.T) {
+	db, errOpen := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if errOpen != nil {
+		t.Fatalf("open sqlite: %v", errOpen)
+	}
+	if errMigrate := db.AutoMigrate(&models.Auth{}, &models.Quota{}); errMigrate != nil {
+		t.Fatalf("migrate sqlite: %v", errMigrate)
+	}
+
+	now := time.Now().UTC()
+	authRow := models.Auth{
+		Key: "kiro-poll-test",
+		Content: datatypes.JSON([]byte(`{
+			"type":"kiro",
+			"label":"Kiro",
+			"refresh_token":"refresh-old",
+			"access_token":"access-old",
+			"expires_at":"2000-01-01T00:00:00Z",
+			"region":"us-east-1"
+		}`)),
+		IsAvailable: true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if errCreate := db.Create(&authRow).Error; errCreate != nil {
+		t.Fatalf("create auth row: %v", errCreate)
+	}
+
+	authStore := store.NewGormAuthStore(db)
+	manager := coreauth.NewManager(authStore, nil, nil)
+	executor := &kiroPollTestExecutor{}
+	manager.RegisterExecutor(executor)
+	if errLoad := manager.Load(context.Background()); errLoad != nil {
+		t.Fatalf("load auth manager: %v", errLoad)
+	}
+
+	poller := NewPoller(db, manager)
+	if poller == nil {
+		t.Fatalf("expected poller to be initialized")
+	}
+	poller.poll(context.Background())
+
+	if executor.refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", executor.refreshCalls)
+	}
+	updatedAuth, ok := manager.GetByID(authRow.Key)
+	if !ok || updatedAuth == nil {
+		t.Fatalf("expected refreshed auth in manager")
+	}
+	if updatedAuth.Metadata["access_token"] != "access-new" || updatedAuth.Metadata["refresh_token"] != "refresh-new" {
+		t.Fatalf("updated metadata = %+v", updatedAuth.Metadata)
+	}
+
+	var quotaRow models.Quota
+	if errFind := db.Where("auth_id = ? AND type = ?", authRow.ID, "kiro").First(&quotaRow).Error; errFind != nil {
+		t.Fatalf("find quota status: %v", errFind)
+	}
+	_, status := UnwrapStoredQuotaData(quotaRow.Data)
+	if status == nil {
+		t.Fatalf("expected kiro auth status")
+	}
+	if status.State != authStatusHealthy || status.NeedsRelogin {
+		t.Fatalf("status = %+v, want healthy", status)
 	}
 }
 

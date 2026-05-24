@@ -1,14 +1,21 @@
 package handlers
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"gorm.io/gorm"
 )
@@ -17,12 +24,17 @@ var refreshSupportedModelsCatalog = cliproxy.RefreshGlobalModelCatalog
 
 // ModelMappingHandler manages admin CRUD endpoints for model mappings.
 type ModelMappingHandler struct {
-	db *gorm.DB // Database handle for model mapping records.
+	db     *gorm.DB    // Database handle for model mapping records.
+	engine *gin.Engine // Full router used for in-process model test requests.
 }
 
 // NewModelMappingHandler constructs a model mapping handler.
-func NewModelMappingHandler(db *gorm.DB) *ModelMappingHandler {
-	return &ModelMappingHandler{db: db}
+func NewModelMappingHandler(db *gorm.DB, engine ...*gin.Engine) *ModelMappingHandler {
+	h := &ModelMappingHandler{db: db}
+	if len(engine) > 0 {
+		h.engine = engine[0]
+	}
+	return h
 }
 
 // createModelMappingRequest captures the payload for creating a model mapping.
@@ -360,4 +372,327 @@ func (h *ModelMappingHandler) RefreshSupportedModels(c *gin.Context) {
 		"source":            result.Source,
 		"changed_providers": result.ChangedProviders,
 	})
+}
+
+type modelTestRequest struct {
+	Provider       string           `json:"provider"`
+	Model          string           `json:"model"`
+	Models         []string         `json:"models"`
+	APIKey         string           `json:"api_key"`
+	APIKeyID       *uint64          `json:"api_key_id"`
+	Prompt         string           `json:"prompt"`
+	Messages       []map[string]any `json:"messages"`
+	MaxTokens      int              `json:"max_tokens"`
+	TimeoutSeconds int              `json:"timeout_seconds"`
+	MaxConcurrency int              `json:"max_concurrency"`
+}
+
+type modelTestResult struct {
+	Model      string `json:"model"`
+	OK         bool   `json:"ok"`
+	LatencyMS  int64  `json:"latency_ms"`
+	StatusCode int    `json:"status_code,omitempty"`
+	ErrorType  string `json:"error_type,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Preview    string `json:"preview,omitempty"`
+}
+
+type resolvedModelTestAPIKey struct {
+	value string
+	id    *uint64
+}
+
+// TestModel sends a small request through the normal /v1/chat/completions path.
+func (h *ModelMappingHandler) TestModel(c *gin.Context) {
+	var body modelTestRequest
+	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	if model == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+	apiKey, statusCode, errMsg := h.resolveModelTestAPIKey(c.Request.Context(), body)
+	if errMsg != "" {
+		c.JSON(statusCode, gin.H{"error": errMsg})
+		return
+	}
+	result := h.runModelTest(c.Request.Context(), model, apiKey, body)
+	c.JSON(http.StatusOK, result)
+}
+
+// BatchTestModels tests multiple models, warming the first model before parallel checks.
+func (h *ModelMappingHandler) BatchTestModels(c *gin.Context) {
+	var body modelTestRequest
+	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	modelsToTest := normalizeModelList(body.Models)
+	provider := strings.ToLower(strings.TrimSpace(body.Provider))
+	if provider == "" {
+		provider = cliproxyauth.KiroProvider
+	}
+	if len(modelsToTest) == 0 {
+		modelsToTest = h.availableProviderModels(provider)
+	}
+	if len(modelsToTest) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "models are required"})
+		return
+	}
+	apiKey, statusCode, errMsg := h.resolveModelTestAPIKey(c.Request.Context(), body)
+	if errMsg != "" {
+		c.JSON(statusCode, gin.H{"error": errMsg})
+		return
+	}
+
+	results := make([]modelTestResult, len(modelsToTest))
+	results[0] = h.runModelTest(c.Request.Context(), modelsToTest[0], apiKey, body)
+
+	concurrency := body.MaxConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	if concurrency > 8 {
+		concurrency = 8
+	}
+	if concurrency > len(modelsToTest) {
+		concurrency = len(modelsToTest)
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	for i := 1; i < len(modelsToTest); i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = h.runModelTest(c.Request.Context(), modelsToTest[i], apiKey, body)
+		}()
+	}
+	wg.Wait()
+
+	okCount := 0
+	for _, result := range results {
+		if result.OK {
+			okCount++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"provider": provider,
+		"summary": gin.H{
+			"total":  len(results),
+			"ok":     okCount,
+			"failed": len(results) - okCount,
+		},
+		"results": results,
+	})
+}
+
+func (h *ModelMappingHandler) resolveModelTestAPIKey(ctx context.Context, body modelTestRequest) (resolvedModelTestAPIKey, int, string) {
+	if direct := strings.TrimSpace(body.APIKey); direct != "" {
+		return resolvedModelTestAPIKey{value: direct}, 0, ""
+	}
+	if body.APIKeyID == nil || *body.APIKeyID == 0 {
+		return resolvedModelTestAPIKey{}, http.StatusBadRequest, "api_key or api_key_id is required"
+	}
+	if h == nil || h.db == nil {
+		return resolvedModelTestAPIKey{}, http.StatusServiceUnavailable, "api key lookup is unavailable"
+	}
+	now := time.Now().UTC()
+	var row models.APIKey
+	errFind := h.db.WithContext(ctx).
+		Where("id = ? AND active = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", *body.APIKeyID, true, now).
+		First(&row).Error
+	if errFind != nil {
+		if errors.Is(errFind, gorm.ErrRecordNotFound) {
+			return resolvedModelTestAPIKey{}, http.StatusNotFound, "api key not found"
+		}
+		return resolvedModelTestAPIKey{}, http.StatusInternalServerError, "api key lookup failed"
+	}
+	id := row.ID
+	return resolvedModelTestAPIKey{value: row.APIKey, id: &id}, 0, ""
+}
+
+func (h *ModelMappingHandler) runModelTest(ctx context.Context, model string, apiKey resolvedModelTestAPIKey, body modelTestRequest) modelTestResult {
+	model = strings.TrimSpace(model)
+	result := modelTestResult{Model: model}
+	if h == nil || h.engine == nil {
+		result.StatusCode = http.StatusServiceUnavailable
+		result.ErrorType = "request_failed"
+		result.Error = "model test router is unavailable"
+		return result
+	}
+	if model == "" {
+		result.StatusCode = http.StatusBadRequest
+		result.ErrorType = "model_unavailable"
+		result.Error = "model is required"
+		return result
+	}
+
+	timeout := time.Duration(body.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if timeout > 2*time.Minute {
+		timeout = 2 * time.Minute
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	payload, errPayload := buildModelTestPayload(model, body)
+	if errPayload != nil {
+		result.StatusCode = http.StatusBadRequest
+		result.ErrorType = "request_failed"
+		result.Error = errPayload.Error()
+		return result
+	}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(reqCtx, http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+apiKey.value)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		h.engine.ServeHTTP(recorder, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-reqCtx.Done():
+		result.LatencyMS = time.Since(start).Milliseconds()
+		result.StatusCode = http.StatusGatewayTimeout
+		result.ErrorType = classifyModelTestError(result.StatusCode, reqCtx.Err().Error())
+		result.Error = reqCtx.Err().Error()
+		return result
+	}
+
+	result.LatencyMS = time.Since(start).Milliseconds()
+	result.StatusCode = recorder.Code
+	responseBody := redactModelTestText(recorder.Body.String(), apiKey.value)
+	if recorder.Code >= 200 && recorder.Code < 300 {
+		result.OK = true
+		result.Preview = truncateModelTestText(responseBody)
+		return result
+	}
+	result.ErrorType = classifyModelTestError(recorder.Code, responseBody)
+	result.Error = truncateModelTestText(responseBody)
+	return result
+}
+
+func buildModelTestPayload(model string, body modelTestRequest) ([]byte, error) {
+	messages := body.Messages
+	if len(messages) == 0 {
+		prompt := strings.TrimSpace(body.Prompt)
+		if prompt == "" {
+			prompt = "Reply with OK."
+		}
+		messages = []map[string]any{{"role": "user", "content": prompt}}
+	}
+	maxTokens := body.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 16
+	}
+	payload := map[string]any{
+		"model":      model,
+		"messages":   messages,
+		"stream":     false,
+		"max_tokens": maxTokens,
+	}
+	return json.Marshal(payload)
+}
+
+func normalizeModelList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		model := strings.TrimSpace(value)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		out = append(out, model)
+	}
+	return out
+}
+
+func (h *ModelMappingHandler) availableProviderModels(provider string) []string {
+	infos := cliproxy.GlobalModelRegistry().GetAvailableModelsByProvider(provider)
+	out := make([]string, 0, len(infos))
+	seen := make(map[string]struct{}, len(infos))
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		model := strings.TrimSpace(info.ID)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		out = append(out, model)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func classifyModelTestError(statusCode int, text string) string {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	switch {
+	case statusCode == http.StatusGatewayTimeout || strings.Contains(lower, "deadline exceeded") || strings.Contains(lower, "timeout"):
+		return "timeout"
+	case strings.Contains(lower, "client disconnect") || strings.Contains(lower, "client canceled") || strings.Contains(lower, "context canceled") || strings.Contains(lower, "broken pipe"):
+		return "client_disconnect"
+	case strings.Contains(lower, "invalid bearer") || strings.Contains(lower, "invalid token") || strings.Contains(lower, "access token"):
+		return "invalid_bearer_token"
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		return "auth_failure"
+	case statusCode == http.StatusNotFound || strings.Contains(lower, "model not") || strings.Contains(lower, "model unavailable") || strings.Contains(lower, "unsupported model"):
+		return "model_unavailable"
+	case strings.Contains(lower, "proxy") || strings.Contains(lower, "socks") || strings.Contains(lower, "connection refused") || strings.Contains(lower, "no such host") || strings.Contains(lower, "dial tcp"):
+		return "proxy_failure"
+	case strings.Contains(lower, "eof") || strings.Contains(lower, "terminated") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "upstream close"):
+		return "upstream_close"
+	case statusCode >= http.StatusInternalServerError:
+		return "upstream_error"
+	default:
+		return "request_failed"
+	}
+}
+
+func redactModelTestText(text string, apiKey string) string {
+	text = strings.TrimSpace(text)
+	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+		text = strings.ReplaceAll(text, apiKey, "[redacted]")
+	}
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"refresh_token", "access_token", "client_secret", "refreshtoken", "accesstoken", "clientsecret"} {
+		if strings.Contains(lower, marker) {
+			return "response body contained token fields and was redacted"
+		}
+	}
+	return text
+}
+
+func truncateModelTestText(text string) string {
+	const maxLen = 512
+	if len(text) <= maxLen {
+		return text
+	}
+	return text[:maxLen]
 }

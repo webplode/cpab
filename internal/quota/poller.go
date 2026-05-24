@@ -189,7 +189,7 @@ func (p *Poller) poll(ctx context.Context) time.Duration {
 		if provider == "" {
 			provider = strings.ToLower(strings.TrimSpace(row.Type))
 		}
-		if provider != "antigravity" && provider != "codex" && provider != "gemini-cli" {
+		if provider != "antigravity" && provider != "codex" && provider != "gemini-cli" && provider != "kiro" {
 			continue
 		}
 
@@ -217,6 +217,8 @@ func (p *Poller) poll(ctx context.Context) time.Duration {
 				p.pollCodex(ctx, authCopy, rowCopy)
 			case "gemini-cli":
 				p.pollGeminiCLI(ctx, authCopy, rowCopy)
+			case "kiro":
+				p.pollKiro(ctx, authCopy, rowCopy)
 			default:
 				return
 			}
@@ -378,6 +380,39 @@ func (p *Poller) pollGeminiCLI(ctx context.Context, auth *coreauth.Auth, row aut
 	}
 	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload, healthyAuthStatus(time.Now().UTC())); errSave != nil {
 		log.WithError(errSave).Warnf("quota poller: gemini-cli save failed (auth=%s)", auth.ID)
+	}
+}
+
+func (p *Poller) pollKiro(ctx context.Context, auth *coreauth.Auth, row authRowInfo) {
+	if auth == nil {
+		return
+	}
+	meta, errMeta := coreauth.ParseKiroMetadata(auth)
+	if errMeta != nil {
+		p.markAuthNeedsRelogin(ctx, auth, row, "kiro", 0, errMeta.Error(), false)
+		return
+	}
+
+	if meta.ShouldRefresh(time.Now().UTC(), 10*time.Minute) {
+		executor, okExecutor := p.manager.Executor("kiro")
+		if !okExecutor || executor == nil {
+			log.Warnf("quota poller: kiro executor not registered (auth=%s)", auth.ID)
+			return
+		}
+		refreshed, errRefresh := executor.Refresh(ctx, auth.Clone())
+		if errRefresh != nil {
+			p.markAuthNeedsRelogin(ctx, auth, row, "kiro", 0, errRefresh.Error(), false)
+			return
+		}
+		if refreshed != nil {
+			if _, errUpdate := p.manager.Update(ctx, refreshed); errUpdate != nil {
+				log.WithError(errUpdate).Warnf("quota poller: kiro refresh persist failed (auth=%s)", auth.ID)
+			}
+		}
+	}
+
+	if errSave := p.saveQuotaStatus(ctx, row.ID, row.Type, healthyAuthStatus(time.Now().UTC())); errSave != nil {
+		log.WithError(errSave).Warnf("quota poller: kiro status save failed (auth=%s)", auth.ID)
 	}
 }
 
