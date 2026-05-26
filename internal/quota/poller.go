@@ -34,6 +34,7 @@ const (
 	maxErrorBodyBytes      = 512
 	tokenInvalidatedCode   = "token_invalidated"
 	authStatusHealthy      = "healthy"
+	authStatusPollFailed   = "poll_failed"
 	authStatusNeedsRelogin = "needs_relogin"
 )
 
@@ -56,6 +57,7 @@ const (
 	quotaEnvelopePayloadKey    = "_cpab_quota_payload"
 	quotaEnvelopeAuthStatusKey = "_cpab_auth_status"
 	authReloginMessage         = "Auth token expired, need re-login"
+	quotaPollFailedMessage     = "Quota poll failed, will retry"
 )
 
 // AuthStatus describes the latest quota poll health for an auth entry.
@@ -311,7 +313,7 @@ func (p *Poller) pollAntigravity(ctx context.Context, auth *coreauth.Auth, row a
 		return
 	}
 
-	p.markAuthNeedsRelogin(ctx, auth, row, "antigravity", lastStatus, lastDetail, false)
+	p.markQuotaPollFailed(ctx, auth, row, "antigravity", lastStatus, lastDetail)
 }
 
 func (p *Poller) pollCodex(ctx context.Context, auth *coreauth.Auth, row authRowInfo) {
@@ -330,7 +332,7 @@ func (p *Poller) pollCodex(ctx context.Context, auth *coreauth.Auth, row authRow
 	status, payload, errReq := p.doRequest(ctx, auth, http.MethodGet, codexUsageURL, nil, headers)
 	if errReq != nil {
 		log.WithError(errReq).Warnf("quota poller: codex request failed (auth=%s)", auth.ID)
-		p.markAuthNeedsRelogin(ctx, auth, row, "codex", 0, errReq.Error(), false)
+		p.markQuotaPollFailed(ctx, auth, row, "codex", 0, errReq.Error())
 		return
 	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
@@ -339,7 +341,7 @@ func (p *Poller) pollCodex(ctx context.Context, auth *coreauth.Auth, row authRow
 			return
 		}
 		log.Warnf("quota poller: codex status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
-		p.markAuthNeedsRelogin(ctx, auth, row, "codex", status, summarizePayload(payload), false)
+		p.markQuotaPollFailed(ctx, auth, row, "codex", status, summarizePayload(payload))
 		return
 	}
 	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload, healthyAuthStatus(time.Now().UTC())); errSave != nil {
@@ -366,7 +368,7 @@ func (p *Poller) pollGeminiCLI(ctx context.Context, auth *coreauth.Auth, row aut
 	status, payload, errReq := p.doRequest(ctx, auth, http.MethodPost, geminiCLIQuotaURL, body, headers)
 	if errReq != nil {
 		log.WithError(errReq).Warnf("quota poller: gemini-cli request failed (auth=%s)", auth.ID)
-		p.markAuthNeedsRelogin(ctx, auth, row, "gemini-cli", 0, errReq.Error(), false)
+		p.markQuotaPollFailed(ctx, auth, row, "gemini-cli", 0, errReq.Error())
 		return
 	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
@@ -375,7 +377,7 @@ func (p *Poller) pollGeminiCLI(ctx context.Context, auth *coreauth.Auth, row aut
 			return
 		}
 		log.Warnf("quota poller: gemini-cli status=%d (auth=%s body=%s)", status, auth.ID, summarizePayload(payload))
-		p.markAuthNeedsRelogin(ctx, auth, row, "gemini-cli", status, summarizePayload(payload), false)
+		p.markQuotaPollFailed(ctx, auth, row, "gemini-cli", status, summarizePayload(payload))
 		return
 	}
 	if errSave := p.saveQuota(ctx, row.ID, row.Type, payload, healthyAuthStatus(time.Now().UTC())); errSave != nil {
@@ -524,6 +526,27 @@ func (p *Poller) markAuthNeedsRelogin(ctx context.Context, auth *coreauth.Auth, 
 	}
 
 	log.Warnf("quota poller: auth requires re-login (provider=%s auth=%s db_id=%d disable=%t status=%d detail=%s)", provider, authID, row.ID, disableAuth, httpStatus, detail)
+}
+
+func (p *Poller) markQuotaPollFailed(ctx context.Context, auth *coreauth.Auth, row authRowInfo, provider string, httpStatus int, detail string) {
+	if p == nil || p.db == nil || auth == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" || row.ID == 0 {
+		return
+	}
+
+	status := pollFailedAuthStatus(time.Now().UTC(), httpStatus, detail)
+	if errSave := p.saveQuotaStatus(ctx, row.ID, row.Type, status); errSave != nil {
+		log.WithError(errSave).Warnf("quota poller: failed to persist auth status (auth=%s provider=%s)", authID, provider)
+	}
+
+	log.Warnf("quota poller: quota poll failed, will retry (provider=%s auth=%s db_id=%d status=%d detail=%s)", provider, authID, row.ID, httpStatus, detail)
 }
 
 func (p *Poller) disableRuntimeAuth(ctx context.Context, authID string) {
@@ -848,6 +871,17 @@ func healthyAuthStatus(now time.Time) *AuthStatus {
 	return &AuthStatus{
 		State:        authStatusHealthy,
 		CheckedAt:    now.UTC(),
+		NeedsRelogin: false,
+	}
+}
+
+func pollFailedAuthStatus(now time.Time, httpStatus int, detail string) *AuthStatus {
+	return &AuthStatus{
+		State:        authStatusPollFailed,
+		Message:      quotaPollFailedMessage,
+		Detail:       strings.TrimSpace(detail),
+		CheckedAt:    now.UTC(),
+		HTTPStatus:   httpStatus,
 		NeedsRelogin: false,
 	}
 }
