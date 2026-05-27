@@ -43,3 +43,15 @@ CLIProxyAPI/.git_backup/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# CodeGraph index
+.codegraph/
+
+# Cursor IDE
+.cursor/
+
+# OpenCode configuration
+opencode.json
+
+# Setup scripts
+setup-opencode-tools.sh
