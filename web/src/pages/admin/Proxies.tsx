@@ -35,9 +35,11 @@ interface ProxyCheckResponse {
     ip: string;
     service: string;
     target_url: string;
+    method?: string;
     latency_ms: number;
     checked_at: string;
     status_code?: number;
+    status_text?: string;
     error?: string;
     failure_stage?: string;
     diagnosis?: string;
@@ -88,7 +90,6 @@ interface BulkAddModalProps {
 }
 
 const PROTOCOL_OPTIONS = ['http', 'https', 'socks5'];
-const PAGE_SIZE = 10;
 
 const inputClassName =
     'w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-background-dark border border-gray-200 dark:border-border-dark rounded-lg text-slate-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent';
@@ -482,7 +483,6 @@ export function AdminProxies() {
     const [selectedProxyIds, setSelectedProxyIds] = useState<number[]>([]);
     const [loading, setLoading] = useState(false);
     const [search, setSearch] = useState('');
-    const [currentPage, setCurrentPage] = useState(1);
     const [createOpen, setCreateOpen] = useState(false);
     const [editingProxy, setEditingProxy] = useState<ProxyItem | null>(null);
     const [bulkOpen, setBulkOpen] = useState(false);
@@ -508,7 +508,6 @@ export function AdminProxies() {
             const url = params.toString() ? `/v0/admin/proxies?${params.toString()}` : '/v0/admin/proxies';
             const res = await apiFetchAdmin<ListResponse>(url);
             setProxies(res.proxies || []);
-            setCurrentPage(1);
         } catch (err) {
             console.error(err);
         } finally {
@@ -522,27 +521,22 @@ export function AdminProxies() {
         }
     }, [fetchProxies, canListProxies]);
 
-    const totalPages = Math.ceil(proxies.length / PAGE_SIZE);
-    const paginatedProxies = useMemo(() => {
-        const start = (currentPage - 1) * PAGE_SIZE;
-        return proxies.slice(start, start + PAGE_SIZE);
-    }, [proxies, currentPage]);
     const selectedProxySet = useMemo(() => new Set(selectedProxyIds), [selectedProxyIds]);
     const selectedProxies = useMemo(
         () => proxies.filter((proxy) => selectedProxySet.has(proxy.id)),
         [proxies, selectedProxySet]
     );
-    const pageProxyIds = useMemo(
-        () => paginatedProxies.map((proxy) => proxy.id),
-        [paginatedProxies]
+    const visibleProxyIds = useMemo(
+        () => proxies.map((proxy) => proxy.id),
+        [proxies]
     );
-    const selectedPageCount = pageProxyIds.filter((id) => selectedProxySet.has(id)).length;
-    const allPageSelected = pageProxyIds.length > 0 && selectedPageCount === pageProxyIds.length;
-    const somePageSelected = selectedPageCount > 0 && !allPageSelected;
+    const selectedVisibleCount = visibleProxyIds.filter((id) => selectedProxySet.has(id)).length;
+    const allVisibleSelected = visibleProxyIds.length > 0 && selectedVisibleCount === visibleProxyIds.length;
+    const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
     const canSelectProxies = canCheckProxies || canBatchDeleteProxies;
 
     const { tableScrollRef, handleTableScroll, showActionsDivider } = useStickyActionsDivider(
-        paginatedProxies.length,
+        proxies.length,
         loading
     );
 
@@ -553,9 +547,9 @@ export function AdminProxies() {
 
     useEffect(() => {
         if (selectPageCheckboxRef.current) {
-            selectPageCheckboxRef.current.indeterminate = somePageSelected;
+            selectPageCheckboxRef.current.indeterminate = someVisibleSelected;
         }
-    }, [somePageSelected]);
+    }, [someVisibleSelected]);
 
     const formatDate = (value: string) => new Date(value).toLocaleString(locale);
 
@@ -636,17 +630,17 @@ export function AdminProxies() {
         });
     };
 
-    const handleTogglePageSelection = (checked: boolean) => {
+    const handleToggleVisibleSelection = (checked: boolean) => {
         setSelectedProxyIds((prev) => {
             if (checked) {
                 const next = new Set(prev);
-                for (const id of pageProxyIds) {
+                for (const id of visibleProxyIds) {
                     next.add(id);
                 }
                 return Array.from(next);
             }
-            const pageIds = new Set(pageProxyIds);
-            return prev.filter((id) => !pageIds.has(id));
+            const visibleIds = new Set(visibleProxyIds);
+            return prev.filter((id) => !visibleIds.has(id));
         });
     };
 
@@ -665,8 +659,9 @@ export function AdminProxies() {
                 status: 'checking',
                 live: false,
                 ip: '',
-                service: '4.ident.me',
-                target_url: 'https://4.ident.me/',
+                service: 'google.com',
+                target_url: 'https://google.com/',
+                method: 'HEAD',
                 latency_ms: 0,
                 checked_at: new Date().toISOString(),
             },
@@ -704,8 +699,9 @@ export function AdminProxies() {
                     status: 'dead',
                     live: false,
                     ip: '',
-                    service: '4.ident.me',
-                    target_url: 'https://4.ident.me/',
+                    service: 'google.com',
+                    target_url: 'https://google.com/',
+                    method: 'HEAD',
                     latency_ms: 0,
                     checked_at: new Date().toISOString(),
                     error: getErrorMessage(err),
@@ -973,17 +969,17 @@ export function AdminProxies() {
                 </div>
 
                 <div className="bg-white dark:bg-surface-dark rounded-xl border border-gray-200 dark:border-border-dark shadow-sm overflow-hidden">
-                    <div ref={tableScrollRef} className="relative overflow-x-auto" onScroll={handleTableScroll}>
+                    <div ref={tableScrollRef} className="relative max-h-[calc(100vh-18rem)] overflow-auto" onScroll={handleTableScroll}>
                         <table className="w-full text-sm text-left text-gray-500 dark:text-gray-400">
-                            <thead className="text-xs text-gray-700 uppercase bg-gray-50 dark:bg-surface-dark dark:text-gray-400 border-b border-gray-200 dark:border-border-dark">
+                            <thead className="sticky top-0 z-10 text-xs text-gray-700 uppercase bg-gray-50 dark:bg-surface-dark dark:text-gray-400 border-b border-gray-200 dark:border-border-dark">
                                 <tr>
                                     <th className="px-6 py-4 font-semibold tracking-wider">
                                             <input
                                                 ref={selectPageCheckboxRef}
                                                 type="checkbox"
-                                                checked={allPageSelected}
-                                                disabled={!canSelectProxies || pageProxyIds.length === 0}
-                                            onChange={(e) => handleTogglePageSelection(e.target.checked)}
+                                                checked={allVisibleSelected}
+                                                disabled={!canSelectProxies || visibleProxyIds.length === 0}
+                                            onChange={(e) => handleToggleVisibleSelection(e.target.checked)}
                                             aria-label={t('Select visible proxies')}
                                             className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-dark dark:bg-background-dark"
                                         />
@@ -1009,14 +1005,14 @@ export function AdminProxies() {
                                             {t('Loading...')}
                                         </td>
                                     </tr>
-                                ) : paginatedProxies.length === 0 ? (
+                                ) : proxies.length === 0 ? (
                                     <tr>
                                         <td colSpan={7} className="px-6 py-12 text-center">
                                             {t('No proxies found')}
                                         </td>
                                     </tr>
                                 ) : (
-                                    paginatedProxies.map((proxy) => (
+                                    proxies.map((proxy) => (
                                         <tr
                                             key={proxy.id}
                                             className="hover:bg-gray-50 dark:hover:bg-background-dark group"
@@ -1088,36 +1084,6 @@ export function AdminProxies() {
                             </tbody>
                         </table>
                     </div>
-                    {totalPages > 1 && (
-                        <div className="px-6 py-4 border-t border-gray-200 dark:border-border-dark flex items-center justify-between">
-                            <div className="text-sm text-slate-500 dark:text-text-secondary">
-                                {t('Showing {{from}} to {{to}} of {{total}} proxies', {
-                                    from: (currentPage - 1) * PAGE_SIZE + 1,
-                                    to: Math.min(currentPage * PAGE_SIZE, proxies.length),
-                                    total: proxies.length,
-                                })}
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <button
-                                    onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                                    disabled={currentPage === 1}
-                                    className="px-3 py-1.5 text-sm font-medium rounded-lg border border-gray-200 dark:border-border-dark bg-white dark:bg-surface-dark text-slate-700 dark:text-white hover:bg-slate-50 dark:hover:bg-border-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                                >
-                                    {t('Previous')}
-                                </button>
-                                <span className="text-sm text-slate-500 dark:text-text-secondary">
-                                    {t('Page {{current}} of {{total}}', { current: currentPage, total: totalPages })}
-                                </span>
-                                <button
-                                    onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-                                    disabled={currentPage === totalPages}
-                                    className="px-3 py-1.5 text-sm font-medium rounded-lg border border-gray-200 dark:border-border-dark bg-white dark:bg-surface-dark text-slate-700 dark:text-white hover:bg-slate-50 dark:hover:bg-border-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                                >
-                                    {t('Next')}
-                                </button>
-                            </div>
-                        </div>
-                    )}
                 </div>
             </div>
 

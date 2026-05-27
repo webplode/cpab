@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -93,5 +94,68 @@ func TestBatchDeleteProxiesDeletesExistingAndReportsMissing(t *testing.T) {
 	}
 	if keptCount != 1 {
 		t.Fatalf("kept row count = %d, want 1", keptCount)
+	}
+}
+
+func TestDefaultProxyCheckUsesDualStackLivenessTarget(t *testing.T) {
+	services, ok := selectProxyCheckServices("")
+	if !ok {
+		t.Fatal("selectProxyCheckServices returned not ok")
+	}
+	if len(services) != 1 {
+		t.Fatalf("default services length = %d, want 1", len(services))
+	}
+	service := normalizeProxyCheckService(services[0])
+	if service.URL != "https://google.com/" {
+		t.Fatalf("default service URL = %q, want https://google.com/", service.URL)
+	}
+	if service.Method != http.MethodHead {
+		t.Fatalf("default service method = %q, want %q", service.Method, http.MethodHead)
+	}
+	if service.ExpectsIP {
+		t.Fatal("default service should not require an IP response body")
+	}
+}
+
+func TestCheckProxyLivenessAllowsHeadWithoutIPBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	ip, statusCode, statusText, errCheck := checkProxyLiveness(
+		context.Background(),
+		"direct",
+		proxyCheckService{
+			Name:   "test",
+			URL:    server.URL,
+			Method: http.MethodHead,
+		},
+	)
+	if errCheck != nil {
+		t.Fatalf("checkProxyLiveness returned error: %v", errCheck)
+	}
+	if ip != "" {
+		t.Fatalf("ip = %q, want empty for HEAD liveness check", ip)
+	}
+	if statusCode != http.StatusNoContent {
+		t.Fatalf("statusCode = %d, want %d", statusCode, http.StatusNoContent)
+	}
+	if !strings.Contains(statusText, "204") {
+		t.Fatalf("statusText = %q, want 204 status", statusText)
+	}
+}
+
+func TestParseProxyCheckIPAcceptsIPv6(t *testing.T) {
+	ip, errParse := parseProxyCheckIP([]byte(`{"ip":"2001:db8::1"}`))
+	if errParse != nil {
+		t.Fatalf("parseProxyCheckIP returned error: %v", errParse)
+	}
+	if ip != "2001:db8::1" {
+		t.Fatalf("ip = %q, want 2001:db8::1", ip)
 	}
 }

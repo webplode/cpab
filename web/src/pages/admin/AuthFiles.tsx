@@ -2083,9 +2083,9 @@ export function AdminAuthFiles() {
                 </div>
 
                 <div className="bg-white dark:bg-surface-dark rounded-xl border border-gray-200 dark:border-border-dark shadow-sm overflow-hidden">
-                    <div ref={tableScrollRef} className="relative overflow-x-auto" onScroll={handleTableScroll}>
+                    <div ref={tableScrollRef} className="relative max-h-[calc(100vh-18rem)] overflow-auto" onScroll={handleTableScroll}>
                         <table className="min-w-full whitespace-nowrap text-sm text-left text-gray-500 dark:text-gray-400">
-                            <thead className="text-xs text-gray-700 uppercase bg-gray-50 dark:bg-surface-dark dark:text-gray-400 border-b border-gray-200 dark:border-border-dark">
+                            <thead className="sticky top-0 z-10 text-xs text-gray-700 uppercase bg-gray-50 dark:bg-surface-dark dark:text-gray-400 border-b border-gray-200 dark:border-border-dark">
                                 <tr>
                                     <th className="px-6 py-4">
                                             <AdminCheckbox

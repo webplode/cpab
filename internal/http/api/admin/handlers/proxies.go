@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	proxyCheckTimeout   = 15 * time.Second
+	proxyCheckTimeout   = 8 * time.Second
 	proxyCheckBodyLimit = 1 << 20
 
 	proxyTestStatusNew    = "new"
@@ -30,45 +30,73 @@ const (
 )
 
 var proxyCheckServices = map[string]proxyCheckService{
+	"google": {
+		Name:   "google.com",
+		URL:    "https://google.com/",
+		Method: http.MethodHead,
+	},
+	"google.com": {
+		Name:   "google.com",
+		URL:    "https://google.com/",
+		Method: http.MethodHead,
+	},
+	"9router": {
+		Name:   "google.com",
+		URL:    "https://google.com/",
+		Method: http.MethodHead,
+	},
 	"ipify": {
-		Name: "ipify",
-		URL:  "https://api.ipify.org?format=json",
+		Name:      "ipify",
+		URL:       "https://api.ipify.org?format=json",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"ipinfo": {
-		Name: "ipinfo",
-		URL:  "https://ipinfo.io/ip",
+		Name:      "ipinfo",
+		URL:       "https://ipinfo.io/ip",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"ident4": {
-		Name: "4.ident.me",
-		URL:  "https://4.ident.me/",
+		Name:      "4.ident.me",
+		URL:       "https://4.ident.me/",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"ident.me": {
-		Name: "4.ident.me",
-		URL:  "https://4.ident.me/",
+		Name:      "4.ident.me",
+		URL:       "https://4.ident.me/",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"4.ident.me": {
-		Name: "4.ident.me",
-		URL:  "https://4.ident.me/",
+		Name:      "4.ident.me",
+		URL:       "https://4.ident.me/",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"l2": {
-		Name: "l2.io",
-		URL:  "https://l2.io/ip.json",
+		Name:      "l2.io",
+		URL:       "https://l2.io/ip.json",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"l2.io": {
-		Name: "l2.io",
-		URL:  "https://l2.io/ip.json",
+		Name:      "l2.io",
+		URL:       "https://l2.io/ip.json",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 	"l2.io/ip.json": {
-		Name: "l2.io",
-		URL:  "https://l2.io/ip.json",
+		Name:      "l2.io",
+		URL:       "https://l2.io/ip.json",
+		Method:    http.MethodGet,
+		ExpectsIP: true,
 	},
 }
 
 var proxyCheckDefaultServices = []proxyCheckService{
-	proxyCheckServices["ident4"],
-	proxyCheckServices["l2"],
-	proxyCheckServices["ipify"],
-	proxyCheckServices["ipinfo"],
+	proxyCheckServices["google"],
 }
 
 // ProxyHandler manages admin proxy CRUD endpoints.
@@ -97,8 +125,10 @@ type batchCreateProxyRequest struct {
 }
 
 type proxyCheckService struct {
-	Name string
-	URL  string
+	Name      string
+	URL       string
+	Method    string
+	ExpectsIP bool
 }
 
 type proxyCheckDiagnosis struct {
@@ -163,7 +193,7 @@ func (h *ProxyHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"proxies": out})
 }
 
-// Check performs an outbound IP echo request through a saved proxy.
+// Check performs an outbound liveness request through a saved proxy.
 func (h *ProxyHandler) Check(c *gin.Context) {
 	id, errID := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
 	if errID != nil {
@@ -217,11 +247,15 @@ func (h *ProxyHandler) Check(c *gin.Context) {
 		"ip":         checkResult.ip,
 		"service":    checkResult.service.Name,
 		"target_url": checkResult.service.URL,
+		"method":     checkResult.service.Method,
 		"latency_ms": time.Since(startedAt).Milliseconds(),
 		"checked_at": startedAt,
 	}
 	if checkResult.statusCode > 0 {
 		result["status_code"] = checkResult.statusCode
+	}
+	if checkResult.statusText != "" {
+		result["status_text"] = checkResult.statusText
 	}
 	if checkResult.err != nil {
 		result["error"] = errorText
@@ -437,6 +471,7 @@ type proxyCheckResult struct {
 	service           proxyCheckService
 	ip                string
 	statusCode        int
+	statusText        string
 	err               error
 	failureStage      string
 	diagnosis         string
@@ -449,18 +484,19 @@ func checkProxyIPWithFallback(parent context.Context, proxyURL string, services 
 	var lastResult proxyCheckResult
 	if len(services) == 0 {
 		return proxyCheckResult{
-			failureStage: "ip_check",
-			diagnosis:    "No IP check service was selected.",
-			err:          errors.New("no IP check service selected"),
+			failureStage: "liveness_check",
+			diagnosis:    "No proxy check target was selected.",
+			err:          errors.New("no proxy check target selected"),
 		}
 	}
 
 	for _, service := range services {
-		ip, statusCode, errCheck := checkProxyIP(parent, proxyURL, service.URL)
+		ip, statusCode, statusText, errCheck := checkProxyLiveness(parent, proxyURL, service)
 		result := proxyCheckResult{
-			service:    service,
+			service:    normalizeProxyCheckService(service),
 			ip:         ip,
 			statusCode: statusCode,
+			statusText: statusText,
 			err:        errCheck,
 		}
 		if errCheck == nil {
@@ -484,10 +520,10 @@ func checkProxyIPWithFallback(parent context.Context, proxyURL string, services 
 	if len(errorsByService) > 0 {
 		lastResult.err = errors.New(strings.Join(errorsByService, "; "))
 		if lastResult.failureStage == "" {
-			lastResult.failureStage = "ip_check"
+			lastResult.failureStage = "liveness_check"
 		}
 		if lastResult.diagnosis == "" {
-			lastResult.diagnosis = "The proxy request reached the IP check step, but every configured IP provider failed."
+			lastResult.diagnosis = "The proxy request reached the liveness check step, but every configured target failed."
 		}
 	}
 	return lastResult
@@ -499,7 +535,7 @@ func diagnoseProxyCheckError(err error, proxyURL string) proxyCheckDiagnosis {
 	}
 
 	errText := strings.ToLower(err.Error())
-	diagnosis := proxyCheckDiagnosis{stage: "ip_check"}
+	diagnosis := proxyCheckDiagnosis{stage: "liveness_check"}
 
 	switch {
 	case strings.Contains(errText, "configure proxy failed") ||
@@ -522,7 +558,7 @@ func diagnoseProxyCheckError(err error, proxyURL string) proxyCheckDiagnosis {
 		strings.Contains(errText, "proxyconnect tcp: write") ||
 		strings.Contains(errText, "connection reset by peer"):
 		diagnosis.stage = "proxy_tunnel"
-		diagnosis.message = "The proxy closed the HTTPS tunnel before the IP provider was reached."
+		diagnosis.message = "The proxy closed the HTTPS tunnel before the liveness target was reached."
 		diagnosis.hint = "Check the proxy protocol, credentials, and whether the proxy supports HTTPS CONNECT."
 		diagnosis.stopFallback = true
 	}
@@ -572,25 +608,26 @@ func httpSchemeProxyURL(raw string) string {
 	return parsed.String()
 }
 
-func checkProxyIP(parent context.Context, proxyURL string, targetURL string) (string, int, error) {
+func checkProxyLiveness(parent context.Context, proxyURL string, service proxyCheckService) (string, int, string, error) {
+	service = normalizeProxyCheckService(service)
 	transport, _, errTransport := proxyutil.BuildHTTPTransport(proxyURL)
 	if errTransport != nil {
-		return "", 0, fmt.Errorf("configure proxy failed: %w", errTransport)
+		return "", 0, "", fmt.Errorf("configure proxy failed: %w", errTransport)
 	}
 	if transport == nil {
-		return "", 0, fmt.Errorf("proxy transport unavailable")
+		return "", 0, "", fmt.Errorf("proxy transport unavailable")
 	}
 	defer transport.CloseIdleConnections()
 
 	ctx, cancel := context.WithTimeout(parent, proxyCheckTimeout)
 	defer cancel()
 
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	req, errReq := http.NewRequestWithContext(ctx, service.Method, service.URL, nil)
 	if errReq != nil {
-		return "", 0, fmt.Errorf("create check request failed: %w", errReq)
+		return "", 0, "", fmt.Errorf("create check request failed: %w", errReq)
 	}
 	req.Header.Set("Accept", "application/json,text/plain;q=0.9,*/*;q=0.8")
-	req.Header.Set("User-Agent", "CLIProxyAPIBusiness Proxy Check")
+	req.Header.Set("User-Agent", "9Router")
 
 	client := &http.Client{
 		Transport: transport,
@@ -598,24 +635,39 @@ func checkProxyIP(parent context.Context, proxyURL string, targetURL string) (st
 	}
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return "", 0, fmt.Errorf("request through proxy failed: %w", errDo)
+		return "", 0, "", fmt.Errorf("request through proxy failed: %w", errDo)
 	}
 	defer resp.Body.Close()
 
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, proxyCheckBodyLimit))
-	if errRead != nil {
-		return "", resp.StatusCode, fmt.Errorf("read check response failed: %w", errRead)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", resp.StatusCode, resp.Status, fmt.Errorf("proxy check returned status %d", resp.StatusCode)
 	}
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", resp.StatusCode, fmt.Errorf("ip check returned status %d", resp.StatusCode)
+	if !service.ExpectsIP {
+		return "", resp.StatusCode, resp.Status, nil
+	}
+
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, proxyCheckBodyLimit))
+	if errRead != nil {
+		return "", resp.StatusCode, resp.Status, fmt.Errorf("read check response failed: %w", errRead)
 	}
 
 	ip, errIP := parseProxyCheckIP(body)
 	if errIP != nil {
-		return "", resp.StatusCode, errIP
+		return "", resp.StatusCode, resp.Status, errIP
 	}
-	return ip, resp.StatusCode, nil
+	return ip, resp.StatusCode, resp.Status, nil
+}
+
+func normalizeProxyCheckService(service proxyCheckService) proxyCheckService {
+	if strings.TrimSpace(service.Method) == "" {
+		if service.ExpectsIP {
+			service.Method = http.MethodGet
+		} else {
+			service.Method = http.MethodHead
+		}
+	}
+	return service
 }
 
 func parseProxyCheckIP(body []byte) (string, error) {

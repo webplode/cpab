@@ -281,31 +281,27 @@ Supports **batch add** by pasting one proxy URL per line (e.g. `socks5://user:pa
 
 CPAB checks proxy liveness only when an administrator clicks **Check** or **Check Selected** in the Proxies page. The frontend calls `POST /v0/admin/proxies/:id/check`; the backend does not continuously ping proxies in the background.
 
-The backend loads the saved proxy URL, builds an HTTP transport with `proxyutil.BuildHTTPTransport`, and sends a `GET` request through that exact proxy configuration to an external IP echo service. Supported saved proxy schemes are `http`, `https`, and `socks5`.
+The backend loads the saved proxy URL, builds an HTTP transport with `proxyutil.BuildHTTPTransport`, and sends a `HEAD` request through that exact proxy configuration to `https://google.com/`, matching 9router's liveness check style. This avoids forcing an IPv4-only IP echo endpoint and lets the proxy resolve/reach the dual-stack target normally. Supported saved proxy schemes are `http`, `https`, and `socks5`.
 
 A proxy is marked live only when:
 
 - The proxy URL can be parsed and configured.
 - The proxy can establish an HTTPS tunnel to the target.
-- The check service returns an HTTP 2xx response within 15 seconds.
-- The response body contains a valid IP address, either as JSON `{ "ip": "..." }` or plain text.
+- The check target returns an HTTP 2xx response within 8 seconds.
 
-Default check services are tried in this order until one succeeds:
+The default check target is:
 
 | Service | Target URL | Response |
 |---------|------------|----------|
-| `4.ident.me` | `https://4.ident.me/` | Plain IPv4 text |
-| `l2.io` | `https://l2.io/ip.json` | JSON `{ "ip": "..." }` |
-| `ipify` | `https://api.ipify.org?format=json` | JSON `{ "ip": "..." }` |
-| `ipinfo` | `https://ipinfo.io/ip` | Plain IP text |
+| `google.com` | `https://google.com/` | HTTP 2xx liveness status |
 
-The endpoint also accepts an optional `service` query parameter to force one service, using names such as `ipify`, `ipinfo`, `ident4`, `4.ident.me`, `l2`, or `l2.io`.
+The endpoint also accepts an optional `service` query parameter to force a target, using names such as `google`, `google.com`, `9router`, `ipify`, `ipinfo`, `ident4`, `4.ident.me`, `l2`, or `l2.io`. The IP echo services remain available for manual diagnostics and still require a valid IP response body.
 
-Fallback is only useful after the proxy request reaches the IP-check step. If the proxy fails while configuring the URL, authenticating, or opening the HTTPS CONNECT tunnel, the backend stops immediately and returns a proxy-specific diagnosis instead of repeating the same proxy failure against every IP provider.
+Fallback is only useful after the proxy request reaches the liveness-check step. If the proxy fails while configuring the URL, authenticating, or opening the HTTPS CONNECT tunnel, the backend stops immediately and returns a proxy-specific diagnosis instead of repeating the same proxy failure against every target.
 
 > **Important:** `https://host:port` means TLS to the proxy server itself. Many proxy providers label a proxy as "HTTPS" because it supports HTTPS destinations via CONNECT, but the proxy URL should still be saved as `http://host:port`. If a check fails with `proxyconnect tcp: EOF`, first verify the protocol field and credentials.
 
-The response includes `live`, `ip`, `service`, `target_url`, `latency_ms`, `checked_at`, and, when available, `status_code`, `error`, `failure_stage`, `diagnosis`, `hint`, or `suggested_proxy_url`.
+The response includes `live`, `ip`, `service`, `target_url`, `method`, `latency_ms`, `checked_at`, and, when available, `status_code`, `status_text`, `error`, `failure_stage`, `diagnosis`, `hint`, or `suggested_proxy_url`.
 
 The dashboard can run the same per-proxy test endpoint for one proxy or all selected proxies. Bulk checks run with browser-side concurrency 10.
 
@@ -316,7 +312,7 @@ After a proxy test, CPAB stores:
 | `test_status` | `active` when live, `error` when dead, `new` before testing |
 | `last_tested_at` | Current timestamp |
 | `last_error` | Empty when live, otherwise the failure reason |
-| `last_checked_ip` | The IP returned by the successful check |
+| `last_checked_ip` | The IP returned by a successful IP echo check; empty for the default liveness check |
 | `is_active` | Set to the test result (`true` for live, `false` for dead) |
 
 Runtime proxy selection does not re-test the proxy on every request. Auto-assignment only selects rows where `is_active === true` and the proxy URL is non-empty. Existing auth files or provider keys that already reference a proxy URL continue to use the configured URL directly.
