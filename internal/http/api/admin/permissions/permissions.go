@@ -239,6 +239,9 @@ var definitions = []Definition{
 	newDefinition("PUT", "/v0/admin/settings/:key", "Update Setting", "Settings"),
 	newDefinition("DELETE", "/v0/admin/settings/:key", "Delete Setting", "Settings"),
 
+	newDefinition("GET", "/v0/admin/migration/export", "Export Migration Bundle", "Migration"),
+	newDefinition("POST", "/v0/admin/migration/import", "Import Migration Bundle", "Migration"),
+
 	newDefinition("GET", "/v0/admin/usage", "View Usage", "Usage"),
 	newDefinition("GET", "/v0/admin/billing/summary", "View Billing Summary", "Billing"),
 

@@ -219,6 +219,10 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	authed.PUT("/settings/:key", settingHandler.Update)
 	authed.DELETE("/settings/:key", settingHandler.Delete)
 
+	migrationHandler := handlers.NewMigrationHandler(db)
+	authed.GET("/migration/export", migrationHandler.Export)
+	authed.POST("/migration/import", migrationHandler.Import)
+
 	dashboardHandler := handlers.NewDashboardHandler(db)
 	authed.GET("/dashboard/kpi", dashboardHandler.KPI)
 	authed.GET("/dashboard/traffic", dashboardHandler.Traffic)

@@ -25,6 +25,7 @@ This guide covers every configurable entity in the admin dashboard, how they rel
   - [Quotas](#quotas)
   - [Logs](#logs)
   - [Dashboard](#dashboard)
+- [Migration Export/Import](#migration-exportimport)
 - [Rate Limiting](#rate-limiting)
 - [Quota & Billing Flow](#quota--billing-flow)
 - [Setup Walkthrough](#setup-walkthrough)
@@ -570,6 +571,34 @@ Request logs with filtering by model, provider, date range. Shows:
 - **Traffic Chart** - Request volume over time
 - **Cost Distribution** - Spending breakdown by model/provider
 - **Recent Transactions** - Latest API calls with details
+
+---
+
+## Migration Export/Import
+
+Use the migration API to move CPAB state between deployments without manually rebuilding users, keys, billing rules, provider credentials, model mappings, plans, quotas, and settings.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/v0/admin/migration/export` | Download a versioned JSON bundle of CPAB database state |
+| `POST` | `/v0/admin/migration/import` | Upsert a previously exported bundle into the current database |
+
+The export contains sensitive operational data, including password hashes, user API keys, provider API keys, auth file content, prepaid card secrets, TOTP/passkey fields, and billing data. Store the JSON bundle like a production database backup.
+
+By default, export includes request usage logs. For a smaller configuration-only migration, use:
+
+```bash
+GET /v0/admin/migration/export?include_usage=false
+```
+
+Recommended migration flow:
+
+1. Export from the old deployment.
+2. Start the new deployment and let normal database migrations run.
+3. Import the exported JSON bundle as a super admin or an admin with Migration permissions.
+4. Restart the service if you want all long-lived in-memory provider/auth state to be reloaded immediately.
+
+Import is id-preserving and transactional. Existing rows with matching primary keys are updated; missing rows are inserted. PostgreSQL sequences are repaired after import so new records continue from the highest imported ID.
 
 ---
 
