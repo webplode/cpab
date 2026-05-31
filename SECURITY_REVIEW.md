@@ -1,5 +1,10 @@
 # Security Review Report — CLIProxyAPIBusiness
 
+> Current audit note: the latest verified findings are now documented in
+> [`docs/security-audit-findings.md`](docs/security-audit-findings.md).
+> The older findings below are retained as historical context and may no longer
+> match the current codebase.
+
 **Date:** 2026-03-15
 **Scope:** Full backend (`internal/`) and frontend (`web/`) codebase
 **Overall Risk Level:** HIGH
