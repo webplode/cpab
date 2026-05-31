@@ -19,7 +19,6 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 // gcInterval defines minimum time between garbage collection runs.
@@ -368,7 +367,6 @@ func (s *GitTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
 		}
 		auth, err := s.readAuthFile(path, dir)
 		if err != nil {
-			log.WithError(err).Warnf("git store: skip auth %s", path)
 			return nil
 		}
 		if auth != nil {

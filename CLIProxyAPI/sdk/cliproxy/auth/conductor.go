@@ -25,6 +25,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/sjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -43,12 +44,6 @@ type ProviderExecutor interface {
 	// HttpRequest injects provider credentials into the supplied HTTP request and executes it.
 	// Callers must close the response body when non-nil.
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
-}
-
-// RefreshAfterErrorEvaluator lets an executor classify execution errors that
-// should trigger one immediate credential refresh and retry on the same auth.
-type RefreshAfterErrorEvaluator interface {
-	ShouldRefreshAfterError(err error) bool
 }
 
 // RequestAuthPreparer lets an executor update missing auth metadata immediately
@@ -576,44 +571,6 @@ func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []stri
 	return []string{resolved}
 }
 
-func (m *Manager) refreshAfterExecutionError(ctx context.Context, auth *Auth, executor ProviderExecutor, execErr error) (*Auth, bool) {
-	if m == nil || auth == nil || executor == nil || execErr == nil {
-		return nil, false
-	}
-	evaluator, ok := executor.(RefreshAfterErrorEvaluator)
-	if !ok || evaluator == nil || !evaluator.ShouldRefreshAfterError(execErr) {
-		return nil, false
-	}
-	updated, errRefresh := executor.Refresh(ctx, auth.Clone())
-	if errRefresh != nil {
-		logEntryWithRequestID(ctx).WithError(errRefresh).Warnf("auth refresh after execution error failed for provider=%s auth_id=%s", auth.Provider, auth.ID)
-		return nil, false
-	}
-	if updated == nil {
-		return nil, false
-	}
-	if strings.TrimSpace(updated.ID) == "" {
-		updated.ID = auth.ID
-	}
-	if strings.TrimSpace(updated.Provider) == "" {
-		updated.Provider = auth.Provider
-	}
-	if updated.Runtime == nil {
-		updated.Runtime = auth.Runtime
-	}
-	if updated.CreatedAt.IsZero() {
-		updated.CreatedAt = auth.CreatedAt
-	}
-	if updated.Status == "" {
-		updated.Status = auth.Status
-	}
-	if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
-		logEntryWithRequestID(ctx).WithError(errUpdate).Warnf("persist refreshed auth after execution error failed for provider=%s auth_id=%s", auth.Provider, auth.ID)
-		return updated.Clone(), true
-	}
-	return updated.Clone(), true
-}
-
 func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	if strings.TrimSpace(requestedModel) == "" {
@@ -868,7 +825,10 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
-				rerr := buildExecutionError(chunk.Err)
+				rerr := &Error{Message: chunk.Err.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
 			}
 			if !forward {
@@ -920,18 +880,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			if refreshed, ok := m.refreshAfterExecutionError(ctx, auth, executor, errStream); ok {
-				auth = refreshed
-				streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, opts)
-				if errStream != nil {
-					if errCtx := ctx.Err(); errCtx != nil {
-						return nil, errCtx
-					}
-				}
+			rerr := &Error{Message: errStream.Error()}
+			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
+				rerr.HTTPStatus = se.StatusCode()
 			}
-		}
-		if errStream != nil {
-			rerr := buildExecutionError(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
@@ -949,7 +901,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
-				rerr := buildExecutionError(bootstrapErr)
+				rerr := &Error{Message: bootstrapErr.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -957,7 +912,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
-				rerr := buildExecutionError(bootstrapErr)
+				rerr := &Error{Message: bootstrapErr.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -965,7 +923,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				lastErr = bootstrapErr
 				continue
 			}
-			rerr := buildExecutionError(bootstrapErr)
+			rerr := &Error{Message: bootstrapErr.Error()}
+			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+				rerr.HTTPStatus = se.StatusCode()
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
@@ -1431,23 +1392,15 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				if refreshed, ok := m.refreshAfterExecutionError(execCtx, auth, executor, errExec); ok {
-					auth = refreshed
-					resp, errExec = executor.Execute(execCtx, auth, execReq, opts)
-					if errExec != nil {
-						if errCtx := execCtx.Err(); errCtx != nil {
-							return cliproxyexecutor.Response{}, errCtx
-						}
-					}
+				result.Error = &Error{Message: errExec.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
 				}
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				result.Error = buildExecutionError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -1538,23 +1491,15 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				if refreshed, ok := m.refreshAfterExecutionError(execCtx, auth, executor, errExec); ok {
-					auth = refreshed
-					resp, errExec = executor.CountTokens(execCtx, auth, execReq, opts)
-					if errExec != nil {
-						if errCtx := execCtx.Err(); errCtx != nil {
-							return cliproxyexecutor.Response{}, errCtx
-						}
-					}
+				result.Error = &Error{Message: errExec.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
 				}
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				result.Error = buildExecutionError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -1637,7 +1582,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errPrepare
 			continue
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
+		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1653,6 +1599,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		return streamResult, nil
 	}
+}
+
+func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth, req cliproxyexecutor.Request) cliproxyexecutor.Request {
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) || authWebsocketsEnabled(auth) || len(req.Payload) == 0 {
+		return req
+	}
+	updated, errDelete := sjson.DeleteBytes(req.Payload, "generate")
+	if errDelete != nil {
+		return req
+	}
+	req.Payload = updated
+	return req
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
@@ -1787,8 +1745,13 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
 	alias := requestedModelAliasFromOptions(opts, fallback)
 	ctx = coreusage.WithRequestedModelAlias(ctx, alias)
-	if effort := reasoningEffortFromOptions(opts); effort != "" {
+	effort := reasoningEffortFromOptions(opts)
+	if effort != "" {
 		ctx = coreusage.WithReasoningEffort(ctx, effort)
+	}
+	serviceTier := serviceTierFromOptions(opts)
+	if serviceTier != "" {
+		ctx = coreusage.WithServiceTier(ctx, serviceTier)
 	}
 	return ctx
 }
@@ -1823,6 +1786,24 @@ func reasoningEffortFromOptions(opts cliproxyexecutor.Options) string {
 		return ""
 	}
 	raw, ok := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
+}
+
+func serviceTierFromOptions(opts cliproxyexecutor.Options) string {
+	if len(opts.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.ServiceTierMetadataKey]
 	if !ok || raw == nil {
 		return ""
 	}
@@ -2658,33 +2639,6 @@ func statusCodeFromError(err error) int {
 	var sc statusCoder
 	if errors.As(err, &sc) && sc != nil {
 		return sc.StatusCode()
-	}
-	if status := classifyTransientTransportStatus(err); status != 0 {
-		return status
-	}
-	return 0
-}
-
-func buildExecutionError(err error) *Error {
-	if err == nil {
-		return nil
-	}
-	return &Error{
-		Message:    err.Error(),
-		HTTPStatus: statusCodeFromError(err),
-	}
-}
-
-func classifyTransientTransportStatus(err error) int {
-	if err == nil {
-		return 0
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return http.StatusBadGateway
-	}
-	lower := strings.ToLower(strings.TrimSpace(err.Error()))
-	if lower == "eof" || strings.Contains(lower, "unexpected eof") {
-		return http.StatusBadGateway
 	}
 	return 0
 }
@@ -3862,7 +3816,10 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
-				result.Error = buildExecutionError(errExec)
+				result.Error = &Error{Message: errExec.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
+				}
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -4188,93 +4145,6 @@ func authLastRefreshTimestamp(a *Auth) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func isRefreshTokenReusedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "refresh_token_reused")
-}
-
-func authRefreshMetadataString(a *Auth, keys ...string) string {
-	if a == nil || len(a.Metadata) == 0 {
-		return ""
-	}
-	for _, key := range keys {
-		if raw, ok := a.Metadata[key]; ok {
-			if value, okValue := raw.(string); okValue {
-				if trimmed := strings.TrimSpace(value); trimmed != "" {
-					return trimmed
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func authHasNewerRefreshState(current, candidate *Auth) bool {
-	if candidate == nil {
-		return false
-	}
-	if current == nil {
-		return true
-	}
-	for _, keys := range [][]string{
-		{"refresh_token", "refreshToken"},
-		{"access_token", "accessToken"},
-		{"id_token", "idToken"},
-	} {
-		candidateValue := authRefreshMetadataString(candidate, keys...)
-		currentValue := authRefreshMetadataString(current, keys...)
-		if candidateValue != "" && candidateValue != currentValue {
-			return true
-		}
-	}
-	candidateRefreshAt, candidateHasRefreshAt := authLastRefreshTimestamp(candidate)
-	currentRefreshAt, currentHasRefreshAt := authLastRefreshTimestamp(current)
-	if candidateHasRefreshAt && (!currentHasRefreshAt || candidateRefreshAt.After(currentRefreshAt)) {
-		return true
-	}
-	candidateExpiry, candidateHasExpiry := candidate.ExpirationTime()
-	currentExpiry, currentHasExpiry := current.ExpirationTime()
-	if candidateHasExpiry && (!currentHasExpiry || candidateExpiry.After(currentExpiry)) {
-		return true
-	}
-	return false
-}
-
-func (m *Manager) recoverRotatedRefreshState(ctx context.Context, stale *Auth) (*Auth, bool) {
-	if m == nil || stale == nil || stale.ID == "" || m.store == nil {
-		return nil, false
-	}
-	items, err := m.store.List(ctx)
-	if err != nil {
-		log.WithError(err).Warnf("auth refresh recovery: failed to list persisted auths for %s", stale.ID)
-		return nil, false
-	}
-	for _, item := range items {
-		if item == nil || item.ID != stale.ID {
-			continue
-		}
-		if !authHasNewerRefreshState(stale, item) {
-			return nil, false
-		}
-		recovered := item.Clone()
-		if recovered == nil {
-			return nil, false
-		}
-		if recovered.Runtime == nil {
-			recovered.Runtime = stale.Runtime
-		}
-		if recovered.LastRefreshedAt.IsZero() {
-			if ts, ok := authLastRefreshTimestamp(recovered); ok {
-				recovered.LastRefreshedAt = ts
-			}
-		}
-		return recovered, true
-	}
-	return nil, false
-}
-
 func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 	for _, key := range keys {
 		if val, ok := meta[key]; ok {
@@ -4329,29 +4199,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		refreshTokenReused := isRefreshTokenReusedErr(err)
-		if refreshTokenReused {
-			if recovered, ok := m.recoverRotatedRefreshState(ctx, auth); ok {
-				if recovered.Runtime == nil {
-					recovered.Runtime = auth.Runtime
-				}
-				if recovered.LastRefreshedAt.IsZero() {
-					recovered.LastRefreshedAt = now
-				}
-				recovered.NextRefreshAfter = time.Time{}
-				recovered.LastError = nil
-				if recovered.UpdatedAt.IsZero() {
-					recovered.UpdatedAt = now
-				}
-				if m.shouldRefresh(recovered, now) {
-					recovered.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
-				}
-				_, _ = m.Update(WithSkipPersist(ctx), recovered)
-				log.Infof("recovered %s, %s after refresh_token_reused by reloading newer persisted tokens", auth.Provider, auth.ID)
-				return
-			}
-		}
-		unauthorized := isUnauthorizedError(err) && !refreshTokenReused
+		unauthorized := isUnauthorizedError(err)
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {

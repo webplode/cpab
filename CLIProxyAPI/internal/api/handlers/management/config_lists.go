@@ -1121,7 +1121,6 @@ func normalizeClaudeKey(entry *config.ClaudeKey) {
 	entry.APIKey = strings.TrimSpace(entry.APIKey)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-	entry.AuthMode = config.NormalizeClaudeAuthMode(entry.AuthMode)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
 	if len(entry.Models) == 0 {

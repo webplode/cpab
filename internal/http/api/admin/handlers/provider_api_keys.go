@@ -136,7 +136,7 @@ func (h *ProviderAPIKeyHandler) Create(c *gin.Context) {
 		Prefix:    strings.TrimSpace(derefString(body.Prefix)),
 		BaseURL:   strings.TrimSpace(derefString(body.BaseURL)),
 		ProxyURL:  proxyURL,
-		AuthMode:  sdkconfig.NormalizeClaudeAuthMode(derefString(body.AuthMode)),
+		AuthMode:  normalizeClaudeAuthMode(derefString(body.AuthMode)),
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -345,7 +345,7 @@ func (h *ProviderAPIKeyHandler) Update(c *gin.Context) {
 		row.ProxyURL = strings.TrimSpace(*body.ProxyURL)
 	}
 	if body.AuthMode != nil {
-		row.AuthMode = sdkconfig.NormalizeClaudeAuthMode(*body.AuthMode)
+		row.AuthMode = normalizeClaudeAuthMode(*body.AuthMode)
 	}
 	if body.Headers != nil {
 		headersJSON, errHeaders := marshalJSON(*body.Headers)
@@ -499,7 +499,6 @@ func (h *ProviderAPIKeyHandler) syncSDKConfig(ctx context.Context) error {
 				Prefix:   strings.TrimSpace(row.Prefix),
 				BaseURL:  strings.TrimSpace(row.BaseURL),
 				ProxyURL: strings.TrimSpace(row.ProxyURL),
-				AuthMode: sdkconfig.NormalizeClaudeAuthMode(row.AuthMode),
 				Headers:  decodeHeaders(row.Headers),
 			}
 			applyJSON(row.Models, &entry.Models)
@@ -597,7 +596,7 @@ func normalizeProviderFields(row *models.ProviderAPIKey) {
 		row.AuthMode = ""
 		row.ExcludedModels = nil
 	case providerClaude:
-		row.AuthMode = sdkconfig.NormalizeClaudeAuthMode(row.AuthMode)
+		row.AuthMode = normalizeClaudeAuthMode(row.AuthMode)
 	default:
 		row.Name = ""
 		row.AuthMode = ""
@@ -747,7 +746,7 @@ func formatProviderRow(row *models.ProviderAPIKey) gin.H {
 	}
 	authMode := ""
 	if normalizeProvider(row.Provider) == providerClaude {
-		authMode = sdkconfig.NormalizeClaudeAuthMode(row.AuthMode)
+		authMode = normalizeClaudeAuthMode(row.AuthMode)
 		if authMode == "" {
 			authMode = "auto"
 		}
@@ -772,10 +771,23 @@ func formatProviderRow(row *models.ProviderAPIKey) gin.H {
 }
 
 func isValidClaudeAuthMode(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "auto", "x-api-key", "x_api_key", "api-key", "anthropic-api-key", "anthropic_api_key", "bearer", "authorization", "authorization-bearer":
+	switch normalizeClaudeAuthMode(value) {
+	case "", "auto", "x-api-key", "bearer":
 		return true
 	default:
 		return false
+	}
+}
+
+func normalizeClaudeAuthMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto":
+		return "auto"
+	case "x-api-key", "x_api_key", "api-key", "anthropic-api-key", "anthropic_api_key":
+		return "x-api-key"
+	case "bearer", "authorization", "authorization-bearer":
+		return "bearer"
+	default:
+		return ""
 	}
 }

@@ -180,15 +180,14 @@ func expandKiroRawModels(rawModels []kiroRawModel) []*registry.ModelInfo {
 			contextLength = 200000
 		}
 		baseModels = append(baseModels, &registry.ModelInfo{
-			ID:              id,
-			Object:          "model",
-			Created:         now,
-			OwnedBy:         "amazon",
-			Type:            "kiro",
-			DisplayName:     display,
-			Description:     raw.Description,
-			ContextLength:   contextLength,
-			UpstreamModelID: id,
+			ID:            id,
+			Object:        "model",
+			Created:       now,
+			OwnedBy:       "amazon",
+			Type:          "kiro",
+			DisplayName:   display,
+			Description:   raw.Description,
+			ContextLength: contextLength,
 		})
 	}
 	return registry.WithKiroVariants(baseModels)

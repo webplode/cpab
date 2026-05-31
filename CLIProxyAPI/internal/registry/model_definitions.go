@@ -119,9 +119,6 @@ func WithKiroVariants(models []*ModelInfo) []*ModelInfo {
 		if baseID == "" {
 			continue
 		}
-		if strings.TrimSpace(model.UpstreamModelID) == "" {
-			model.UpstreamModelID = baseID
-		}
 		variants = append(variants,
 			kiroVariantModelInfo(model, baseID+kiroThinkingSuffix, "Thinking"),
 			kiroVariantModelInfo(model, baseID+kiroAgenticSuffix, "Agentic"),
@@ -138,7 +135,6 @@ func kiroVariantModelInfo(base *ModelInfo, id string, label string) *ModelInfo {
 	variant := cloneModelInfo(base)
 	variant.ID = id
 	variant.Name = id
-	variant.UpstreamModelID = base.UpstreamModelID
 	if display := strings.TrimSpace(base.DisplayName); display != "" {
 		variant.DisplayName = display + " " + label
 	}

@@ -45,7 +45,7 @@ func TestApplyToConfig_Gemini(t *testing.T) {
 	}
 }
 
-func TestApplyToConfig_ClaudeAuthMode(t *testing.T) {
+func TestApplyToConfig_ClaudeKey(t *testing.T) {
 	rows := []models.ProviderAPIKey{
 		{
 			Provider: "claude",
@@ -61,8 +61,11 @@ func TestApplyToConfig_ClaudeAuthMode(t *testing.T) {
 	if len(cfg.ClaudeKey) != 1 {
 		t.Fatalf("expected 1 claude key, got %d", len(cfg.ClaudeKey))
 	}
-	if got := cfg.ClaudeKey[0].AuthMode; got != sdkconfig.ClaudeAuthModeXAPIKey {
-		t.Fatalf("AuthMode = %q, want %q", got, sdkconfig.ClaudeAuthModeXAPIKey)
+	if cfg.ClaudeKey[0].APIKey != "claude-key" {
+		t.Fatalf("expected api key=claude-key, got %q", cfg.ClaudeKey[0].APIKey)
+	}
+	if cfg.ClaudeKey[0].BaseURL != "https://claude.example.com" {
+		t.Fatalf("expected base url to be preserved, got %q", cfg.ClaudeKey[0].BaseURL)
 	}
 }
 

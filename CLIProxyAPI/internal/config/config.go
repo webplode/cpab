@@ -401,10 +401,6 @@ type ClaudeKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
-	// AuthMode controls which authentication header is used for Claude API key requests.
-	// Empty means auto: use x-api-key for api.anthropic.com and Authorization for custom bases.
-	AuthMode string `yaml:"auth-mode,omitempty" json:"auth-mode,omitempty"`
-
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
 
@@ -428,25 +424,6 @@ type ClaudeKey struct {
 
 func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
 func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
-
-const (
-	ClaudeAuthModeXAPIKey = "x-api-key"
-	ClaudeAuthModeBearer  = "bearer"
-)
-
-// NormalizeClaudeAuthMode canonicalizes Claude auth header mode values.
-func NormalizeClaudeAuthMode(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "auto":
-		return ""
-	case ClaudeAuthModeXAPIKey, "x_api_key", "api-key", "anthropic-api-key", "anthropic_api_key":
-		return ClaudeAuthModeXAPIKey
-	case ClaudeAuthModeBearer, "authorization", "authorization-bearer":
-		return ClaudeAuthModeBearer
-	default:
-		return strings.ToLower(strings.TrimSpace(value))
-	}
-}
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
@@ -954,7 +931,6 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
-		entry.AuthMode = NormalizeClaudeAuthMode(entry.AuthMode)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}

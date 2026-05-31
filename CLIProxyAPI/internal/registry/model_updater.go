@@ -34,8 +34,10 @@ type modelStore struct {
 
 var modelsCatalogStore = &modelStore{}
 
-var updaterOnce sync.Once
-var refreshNowMu sync.Mutex
+var (
+	updaterOnce  sync.Once
+	refreshNowMu sync.Mutex
+)
 
 // ModelRefreshCallback is invoked when startup or periodic model refresh detects changes.
 // changedProviders contains the provider names whose model definitions changed.
@@ -114,11 +116,21 @@ func tryStartupRefresh(ctx context.Context) {
 }
 
 func tryRefreshModels(ctx context.Context, label string) {
-	changed, url, err := refreshModelsFromRemote(ctx)
-	if err != nil {
+	oldData := getModels()
+
+	parsed, url := fetchModelsFromRemote(ctx)
+	if parsed == nil {
 		log.Warnf("%s: fetch failed from all URLs, keeping current data", label)
 		return
 	}
+
+	// Detect changes before updating store.
+	changed := detectChangedProviders(oldData, parsed)
+
+	// Update store with new data regardless.
+	modelsCatalogStore.mu.Lock()
+	modelsCatalogStore.data = parsed
+	modelsCatalogStore.mu.Unlock()
 
 	if len(changed) == 0 {
 		log.Infof("%s completed from %s, no changes detected", label, url)

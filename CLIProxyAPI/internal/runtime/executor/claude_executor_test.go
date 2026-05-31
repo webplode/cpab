@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -43,20 +42,6 @@ func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Reques
 	ginCtx.Request = ginReq
 
 	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
-	return req.WithContext(context.WithValue(req.Context(), "gin", ginCtx))
-}
-
-func newClaudeHeaderTestRequestForURL(t *testing.T, incoming http.Header, rawURL string) *http.Request {
-	t.Helper()
-
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(recorder)
-	ginReq := httptest.NewRequest(http.MethodPost, rawURL, nil)
-	ginReq.Header = incoming.Clone()
-	ginCtx.Request = ginReq
-
-	req := httptest.NewRequest(http.MethodPost, rawURL, nil)
 	return req.WithContext(context.WithValue(req.Context(), "gin", ginCtx))
 }
 
@@ -119,99 +104,6 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	assertClaudeFingerprint(t, req.Header, "evil-client/9.9", "9.9.9", "v24.5.0", "Linux", "x64")
 	if got := req.Header.Get("X-Stainless-Timeout"); got != "900" {
 		t.Fatalf("X-Stainless-Timeout = %q, want %q", got, "900")
-	}
-}
-
-func TestPrepareRequest_ClaudeCustomBaseUsesConfiguredAPIKeyMode(t *testing.T) {
-	cfg := &config.Config{
-		ClaudeKey: []config.ClaudeKey{{
-			APIKey:   "key-123",
-			BaseURL:  "https://claude.compat.example",
-			AuthMode: config.ClaudeAuthModeXAPIKey,
-		}},
-	}
-	executor := NewClaudeExecutor(cfg)
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": "https://claude.compat.example",
-	}}
-	req := httptest.NewRequest(http.MethodPost, "https://claude.compat.example/v1/messages", nil)
-
-	if err := executor.PrepareRequest(req, auth); err != nil {
-		t.Fatalf("PrepareRequest returned error: %v", err)
-	}
-	if got := req.Header.Get("x-api-key"); got != "key-123" {
-		t.Fatalf("x-api-key = %q, want %q", got, "key-123")
-	}
-	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("Authorization = %q, want empty", got)
-	}
-}
-
-func TestPrepareRequest_ClaudeCustomBaseDefaultsToBearer(t *testing.T) {
-	executor := NewClaudeExecutor(&config.Config{
-		ClaudeKey: []config.ClaudeKey{{
-			APIKey:  "key-123",
-			BaseURL: "https://claude.compat.example",
-		}},
-	})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": "https://claude.compat.example",
-	}}
-	req := httptest.NewRequest(http.MethodPost, "https://claude.compat.example/v1/messages", nil)
-
-	if err := executor.PrepareRequest(req, auth); err != nil {
-		t.Fatalf("PrepareRequest returned error: %v", err)
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer key-123" {
-		t.Fatalf("Authorization = %q, want %q", got, "Bearer key-123")
-	}
-	if got := req.Header.Get("x-api-key"); got != "" {
-		t.Fatalf("x-api-key = %q, want empty", got)
-	}
-}
-
-func TestApplyClaudeHeaders_ClaudeCustomBaseUsesConfiguredAPIKeyMode(t *testing.T) {
-	cfg := &config.Config{
-		ClaudeKey: []config.ClaudeKey{{
-			APIKey:   "key-123",
-			BaseURL:  "https://claude.compat.example",
-			AuthMode: config.ClaudeAuthModeXAPIKey,
-		}},
-	}
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-123",
-		"base_url": "https://claude.compat.example",
-	}}
-	req := newClaudeHeaderTestRequestForURL(t, http.Header{}, "https://claude.compat.example/v1/messages")
-
-	applyClaudeHeaders(req, auth, "key-123", false, nil, cfg)
-
-	if got := req.Header.Get("x-api-key"); got != "key-123" {
-		t.Fatalf("x-api-key = %q, want %q", got, "key-123")
-	}
-	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("Authorization = %q, want empty", got)
-	}
-}
-
-func TestShouldUseClaudeAPIKeyHeader_AutoUsesOfficialAnthropicHostOnly(t *testing.T) {
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
-	officialURL, errOfficial := url.Parse("https://api.anthropic.com/v1/messages")
-	if errOfficial != nil {
-		t.Fatalf("url.Parse official returned error: %v", errOfficial)
-	}
-	customURL, errCustom := url.Parse("https://claude.compat.example/v1/messages")
-	if errCustom != nil {
-		t.Fatalf("url.Parse custom returned error: %v", errCustom)
-	}
-
-	if !shouldUseClaudeAPIKeyHeader(&config.Config{}, auth, officialURL) {
-		t.Fatal("expected official Anthropic host to use x-api-key in auto mode")
-	}
-	if shouldUseClaudeAPIKeyHeader(&config.Config{}, auth, customURL) {
-		t.Fatal("expected custom host to stay on bearer mode in auto mode")
 	}
 }
 
@@ -1356,6 +1248,63 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 	}
 	if hasTTLOrderingViolation(seenBody) {
 		t.Fatalf("count_tokens body still has ttl ordering violations: %s", string(seenBody))
+	}
+}
+
+func TestClaudeExecutor_ExecuteSanitizesSignaturesBeforeUpstream(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+
+	payload := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"max_tokens": 16,
+		"messages": [
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"drop this","signature":""},
+				{"type":"text","text":"I will run git status."},
+				{"type":"tool_use","id":"Bash-1","name":"Bash","input":{"command":"git status"},"signature":"bad","thoughtSignature":"bad2","model":"claude-opus-4-1"}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"Bash-1","content":"ok"}]}
+		]
+	}`)
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       false,
+	}); err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	parts := gjson.GetBytes(seenBody, "messages.0.content").Array()
+	if len(parts) != 2 {
+		t.Fatalf("messages.0.content length = %d, want 2; body=%s", len(parts), seenBody)
+	}
+	if parts[0].Get("type").String() != "text" {
+		t.Fatalf("first remaining part = %s, want text", parts[0].Raw)
+	}
+	toolUse := parts[1]
+	if toolUse.Get("type").String() != "tool_use" {
+		t.Fatalf("second remaining part = %s, want tool_use", toolUse.Raw)
+	}
+	for _, path := range []string{"signature", "thoughtSignature", "model"} {
+		if toolUse.Get(path).Exists() {
+			t.Fatalf("tool_use.%s should be removed before upstream: %s", path, seenBody)
+		}
 	}
 }
 

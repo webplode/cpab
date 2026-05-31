@@ -312,7 +312,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.routerConfigurator != nil {
 		optionState.routerConfigurator(engine, s.handlers, cfg)
 	}
-	s.registerDefaultHealthzRoutes()
 
 	// Register management routes when configuration or environment secrets are available,
 	// or when a local management password is provided (e.g. TUI mode).
@@ -361,6 +360,17 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
+	healthzHandler := func(c *gin.Context) {
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	}
+	s.engine.GET("/healthz", healthzHandler)
+	s.engine.HEAD("/healthz", healthzHandler)
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
@@ -494,34 +504,6 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
-}
-
-func (s *Server) registerDefaultHealthzRoutes() {
-	if s == nil || s.engine == nil {
-		return
-	}
-	if !routeExists(s.engine, http.MethodGet, "/healthz") {
-		s.engine.GET("/healthz", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		})
-	}
-	if !routeExists(s.engine, http.MethodHead, "/healthz") {
-		s.engine.HEAD("/healthz", func(c *gin.Context) {
-			c.Status(http.StatusOK)
-		})
-	}
-}
-
-func routeExists(engine *gin.Engine, method, path string) bool {
-	if engine == nil {
-		return false
-	}
-	for _, route := range engine.Routes() {
-		if route.Method == method && route.Path == path {
-			return true
-		}
-	}
-	return false
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
