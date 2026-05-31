@@ -317,6 +317,13 @@ interface BatchDeleteResponse {
     missing_ids?: number[];
 }
 
+interface ForceQuotaCheckResponse {
+    requested: number;
+    checked: number;
+    skipped: number;
+    missing: number;
+}
+
 interface ConfirmDialogState {
     title: string;
     message: string;
@@ -501,6 +508,7 @@ export function AdminAuthFiles() {
     const canExportAllAuthFiles = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/auth-files/export'));
     const canExportSelectedAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/export'));
     const canBatchDeleteAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/batch-delete'));
+    const canForceQuotaCheck = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/quotas/check'));
 
     const [authFiles, setAuthFiles] = useState<AuthFile[]>([]);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -565,6 +573,7 @@ export function AdminAuthFiles() {
     const [batchGroupMenuOpen, setBatchGroupMenuOpen] = useState(false);
     const [batchGroupSearch, setBatchGroupSearch] = useState('');
     const [batchDeleteSubmitting, setBatchDeleteSubmitting] = useState(false);
+    const [forceQuotaSubmitting, setForceQuotaSubmitting] = useState(false);
     const [selectedProxyIds, setSelectedProxyIds] = useState<Set<number>>(new Set());
     const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -609,7 +618,8 @@ export function AdminAuthFiles() {
     const canBindProxies = canUpdateAuthFiles && canListProxies;
     const canBatchGroup = canUpdateAuthFiles && canListGroups;
     const canExportAuthFiles = canExportAllAuthFiles || canExportSelectedAuthFiles;
-    const canSelectAuthFiles = canUpdateAuthFiles || canExportSelectedAuthFiles || canBatchDeleteAuthFiles;
+    const canSelectAuthFiles =
+        canUpdateAuthFiles || canExportSelectedAuthFiles || canBatchDeleteAuthFiles || canForceQuotaCheck;
     const visibleIds = authFiles.map((file) => file.id);
     const anyVisibleSelected = visibleIds.some((id) => selectedIds.has(id));
     const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
@@ -1213,6 +1223,46 @@ export function AdminAuthFiles() {
             );
         } catch (err) {
             console.error('Failed to set unavailable:', err);
+        }
+    };
+
+    const handleToggleSelectAllAuthFiles = () => {
+        if (!canSelectAuthFiles || authFiles.length === 0) {
+            return;
+        }
+        setSelectedIds((prev) => {
+            const next = new Set(prev);
+            if (allVisibleSelected) {
+                visibleIds.forEach((id) => next.delete(id));
+            } else {
+                visibleIds.forEach((id) => next.add(id));
+            }
+            return next;
+        });
+    };
+
+    const handleForceQuotaCheck = async () => {
+        if (!canForceQuotaCheck || selectedCount === 0 || forceQuotaSubmitting) {
+            return;
+        }
+        setForceQuotaSubmitting(true);
+        try {
+            const result = await apiFetchAdmin<ForceQuotaCheckResponse>('/v0/admin/quotas/check', {
+                method: 'POST',
+                body: JSON.stringify({ auth_ids: Array.from(selectedIds) }),
+            });
+            showToast(
+                t('Quota check completed for {{checked}} auth files. {{skipped}} skipped, {{missing}} missing.', {
+                    checked: result.checked,
+                    skipped: result.skipped,
+                    missing: result.missing,
+                })
+            );
+        } catch (err) {
+            console.error('Failed to force quota check:', err);
+            showToast(err instanceof Error ? err.message : t('Failed to force quota check.'));
+        } finally {
+            setForceQuotaSubmitting(false);
         }
     };
 
@@ -1882,10 +1932,48 @@ export function AdminAuthFiles() {
             subtitle={t('Manage authentication groups and their configurations.')}
         >
             <div className="space-y-6">
-                {(canOpenNewMenu || canBindProxies || canBatchGroup || canBatchDeleteAuthFiles || canExportAuthFiles) && (
-                    <div className="flex justify-end gap-2">
-                        {canBatchGroup && (
-                            <button
+                {(canOpenNewMenu ||
+                    canBindProxies ||
+                    canBatchGroup ||
+                    canBatchDeleteAuthFiles ||
+                    canExportAuthFiles ||
+                    canSelectAuthFiles ||
+                    canForceQuotaCheck) && (
+                      <div className="flex justify-end gap-2">
+                          {canSelectAuthFiles && (
+                              <button
+                                  onClick={handleToggleSelectAllAuthFiles}
+                                  disabled={loading || authFiles.length === 0}
+                                  title={
+                                      authFiles.length === 0
+                                          ? t('No auth files found')
+                                          : allVisibleSelected
+                                            ? t('Clear Selection')
+                                            : t('Select all auth files')
+                                  }
+                                  className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium border border-gray-200 dark:border-border-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                  <Icon name={allVisibleSelected ? 'deselect' : 'select_all'} size={18} />
+                                  {allVisibleSelected ? t('Clear Selection') : t('Select All')}
+                              </button>
+                          )}
+                          {canForceQuotaCheck && (
+                              <button
+                                  onClick={handleForceQuotaCheck}
+                                  disabled={selectedCount === 0 || forceQuotaSubmitting}
+                                  title={
+                                      selectedCount === 0
+                                          ? t('Please select at least one auth file.')
+                                          : t('Force Quota Check')
+                                  }
+                                  className="flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors font-medium border border-blue-200 dark:border-blue-900/50 disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                  <Icon name="speed" size={18} />
+                                  {forceQuotaSubmitting ? t('Checking...') : t('Force Quota Check')}
+                              </button>
+                          )}
+                          {canBatchGroup && (
+                              <button
                                 onClick={handleOpenBatchGroupModal}
                                 disabled={selectedCount === 0}
                                 title={

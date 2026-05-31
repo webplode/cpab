@@ -82,6 +82,20 @@ type authRowInfo struct {
 	IsAvailable bool
 }
 
+// ForceCheckResult summarizes a manually requested quota check.
+type ForceCheckResult struct {
+	Requested int `json:"requested"`
+	Checked   int `json:"checked"`
+	Skipped   int `json:"skipped"`
+	Missing   int `json:"missing"`
+}
+
+type forceCheckCandidate struct {
+	auth     *coreauth.Auth
+	row      authRowInfo
+	provider string
+}
+
 // Poller periodically fetches quota data for stored auth entries.
 type Poller struct {
 	db             *gorm.DB
@@ -229,6 +243,120 @@ func (p *Poller) poll(ctx context.Context) time.Duration {
 
 	wg.Wait()
 	return interval
+}
+
+// ForceCheckAuthIDs immediately polls quota for selected auth database row IDs.
+func (p *Poller) ForceCheckAuthIDs(ctx context.Context, authRowIDs []uint64) (ForceCheckResult, error) {
+	var result ForceCheckResult
+	if p == nil || p.db == nil || p.manager == nil {
+		return result, errors.New("quota poller: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	selected := make(map[uint64]struct{}, len(authRowIDs))
+	for _, id := range authRowIDs {
+		if id == 0 {
+			continue
+		}
+		if _, exists := selected[id]; exists {
+			continue
+		}
+		selected[id] = struct{}{}
+	}
+	result.Requested = len(selected)
+	if result.Requested == 0 {
+		return result, errors.New("quota poller: no auth ids selected")
+	}
+
+	_, maxConcurrency := p.resolvePollConfig()
+	if maxConcurrency <= 0 {
+		maxConcurrency = 1
+	}
+
+	rowMap, errRows := p.loadAuthRows(ctx)
+	if errRows != nil {
+		return result, errRows
+	}
+
+	authByID := make(map[string]*coreauth.Auth)
+	for _, auth := range p.manager.List() {
+		if auth == nil {
+			continue
+		}
+		authID := strings.TrimSpace(auth.ID)
+		if authID == "" {
+			continue
+		}
+		authByID[authID] = auth
+	}
+
+	foundRows := make(map[uint64]struct{}, len(selected))
+	candidates := make([]forceCheckCandidate, 0, len(selected))
+	for authID, row := range rowMap {
+		if _, wanted := selected[row.ID]; !wanted {
+			continue
+		}
+		foundRows[row.ID] = struct{}{}
+		if row.RuntimeOnly || !row.IsAvailable {
+			result.Skipped++
+			continue
+		}
+
+		auth := authByID[authID]
+		if auth == nil || auth.Disabled || strings.TrimSpace(auth.ID) == "" {
+			result.Skipped++
+			continue
+		}
+
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(row.Type))
+		}
+		if provider != "antigravity" && provider != "codex" && provider != "gemini-cli" && provider != "kiro" {
+			result.Skipped++
+			continue
+		}
+
+		candidates = append(candidates, forceCheckCandidate{
+			auth:     auth,
+			row:      row,
+			provider: provider,
+		})
+	}
+
+	result.Missing = result.Requested - len(foundRows)
+	result.Checked = len(candidates)
+
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	for _, candidate := range candidates {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return result, ctx.Err()
+		}
+
+		wg.Add(1)
+		candidateCopy := candidate
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			switch candidateCopy.provider {
+			case "antigravity":
+				p.pollAntigravity(ctx, candidateCopy.auth, candidateCopy.row)
+			case "codex":
+				p.pollCodex(ctx, candidateCopy.auth, candidateCopy.row)
+			case "gemini-cli":
+				p.pollGeminiCLI(ctx, candidateCopy.auth, candidateCopy.row)
+			case "kiro":
+				p.pollKiro(ctx, candidateCopy.auth, candidateCopy.row)
+			}
+		}()
+	}
+	wg.Wait()
+	return result, nil
 }
 
 func (p *Poller) loadAuthRows(ctx context.Context) (map[string]authRowInfo, error) {

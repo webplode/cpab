@@ -165,6 +165,7 @@ var definitions = []Definition{
 	newDefinition("GET", "/v0/admin/auth-files/types", "List Auth File Types", "Auth Files"),
 
 	newDefinition("GET", "/v0/admin/quotas", "List Quotas", "Quota"),
+	newDefinition("POST", "/v0/admin/quotas/check", "Force Quota Check", "Quota"),
 
 	newDefinition("POST", "/v0/admin/model-mappings", "Create Model Mapping", "Models"),
 	newDefinition("GET", "/v0/admin/model-mappings", "List Model Mappings", "Models"),

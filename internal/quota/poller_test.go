@@ -234,6 +234,46 @@ func TestMarkQuotaPollFailedKeepsQuotaAndDoesNotRequireRelogin(t *testing.T) {
 	}
 }
 
+func TestForceCheckAuthIDsSkipsUnavailableAuth(t *testing.T) {
+	db, errOpen := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if errOpen != nil {
+		t.Fatalf("open sqlite: %v", errOpen)
+	}
+	if errMigrate := db.AutoMigrate(&models.Auth{}, &models.Quota{}); errMigrate != nil {
+		t.Fatalf("migrate sqlite: %v", errMigrate)
+	}
+
+	now := time.Now().UTC()
+	authRow := models.Auth{
+		Key:         "codex-force-check-unavailable",
+		Content:     datatypes.JSON([]byte(`{"type":"codex","email":"test@example.com"}`)),
+		IsAvailable: false,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if errCreate := db.Create(&authRow).Error; errCreate != nil {
+		t.Fatalf("create auth row: %v", errCreate)
+	}
+	if errUpdate := db.Model(&models.Auth{}).Where("id = ?", authRow.ID).Update("is_available", false).Error; errUpdate != nil {
+		t.Fatalf("mark auth row unavailable: %v", errUpdate)
+	}
+
+	authStore := store.NewGormAuthStore(db)
+	manager := coreauth.NewManager(authStore, nil, nil)
+	if errLoad := manager.Load(context.Background()); errLoad != nil {
+		t.Fatalf("load auth manager: %v", errLoad)
+	}
+
+	poller := NewPoller(db, manager)
+	result, errCheck := poller.ForceCheckAuthIDs(context.Background(), []uint64{authRow.ID})
+	if errCheck != nil {
+		t.Fatalf("force check unavailable auth: %v", errCheck)
+	}
+	if result.Requested != 1 || result.Checked != 0 || result.Skipped != 1 || result.Missing != 0 {
+		t.Fatalf("result = %+v, want requested=1 checked=0 skipped=1 missing=0", result)
+	}
+}
+
 type codexPollTestExecutor struct {
 	httpErr error
 }

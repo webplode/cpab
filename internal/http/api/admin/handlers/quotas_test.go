@@ -161,7 +161,7 @@ func TestQuotaHandlerListIncludesSubscriptionFromTopLevelIDToken(t *testing.T) {
 		t.Fatalf("create quota: %v", errCreate)
 	}
 
-	handler := NewQuotaHandler(db)
+	handler := NewQuotaHandler(db, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v0/admin/quotas?page=1&limit=12", nil)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -212,6 +212,9 @@ func TestQuotaHandlerListIncludesAuthStatusAndUnwrappedPayload(t *testing.T) {
 	if errCreate := db.Create(&auth).Error; errCreate != nil {
 		t.Fatalf("create auth: %v", errCreate)
 	}
+	if errUpdate := db.Model(&models.Auth{}).Where("id = ?", auth.ID).Update("is_available", false).Error; errUpdate != nil {
+		t.Fatalf("mark auth unavailable: %v", errUpdate)
+	}
 
 	storedQuota, errMarshal := quotapkg.MarshalStoredQuotaData([]byte(`{"remaining":12}`), &quotapkg.AuthStatus{
 		State:        "needs_relogin",
@@ -236,7 +239,7 @@ func TestQuotaHandlerListIncludesAuthStatusAndUnwrappedPayload(t *testing.T) {
 		t.Fatalf("create quota: %v", errCreate)
 	}
 
-	handler := NewQuotaHandler(db)
+	handler := NewQuotaHandler(db, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v0/admin/quotas?page=1&limit=12", nil)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -269,6 +272,12 @@ func TestQuotaHandlerListIncludesAuthStatusAndUnwrappedPayload(t *testing.T) {
 	authStatus, ok := response.Quotas[0]["auth_status"].(map[string]any)
 	if !ok {
 		t.Fatalf("auth_status = %T, want map[string]any", response.Quotas[0]["auth_status"])
+	}
+	if response.Quotas[0]["auth_available"] != false {
+		t.Fatalf("auth_available = %v, want false", response.Quotas[0]["auth_available"])
+	}
+	if response.Quotas[0]["quota_polling_status"] != "disabled" {
+		t.Fatalf("quota_polling_status = %v, want disabled", response.Quotas[0]["quota_polling_status"])
 	}
 	if authStatus["message"] != "Auth token expired, need re-login" {
 		t.Fatalf("message = %v, want relogin message", authStatus["message"])
@@ -309,7 +318,7 @@ func TestQuotaHandlerListIncludesOAuthInfoSummary(t *testing.T) {
 		t.Fatalf("create quota: %v", errCreate)
 	}
 
-	handler := NewQuotaHandler(db)
+	handler := NewQuotaHandler(db, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v0/admin/quotas?page=1&limit=10", nil)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -384,7 +393,7 @@ func TestQuotaHandlerListIncludesNestedOAuthInfoSummary(t *testing.T) {
 		t.Fatalf("create quota: %v", errCreate)
 	}
 
-	handler := NewQuotaHandler(db)
+	handler := NewQuotaHandler(db, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v0/admin/quotas?page=1&limit=10", nil)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)

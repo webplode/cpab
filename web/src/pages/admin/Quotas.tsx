@@ -38,6 +38,9 @@ interface QuotaRecord {
     type: string;
     data: unknown;
     updated_at: string;
+    auth_available?: boolean;
+    quota_polling_status?: string;
+    quota_polling_status_label?: string;
     subscription?: SubscriptionInfo;
     auth_status?: AuthStatusInfo;
     oauth?: OAuthInfo;
@@ -699,6 +702,10 @@ function getOAuthRefreshStatusClasses(status: string): string {
     }
 }
 
+function isQuotaPollingDisabled(quota: QuotaRecord): boolean {
+    return quota.auth_available === false || toStringValue(quota.quota_polling_status) === 'disabled';
+}
+
 function toRecord(value: unknown): Record<string, unknown> | null {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return null;
@@ -1072,24 +1079,44 @@ export function AdminQuotas() {
                         {t('No quota data available')}
                     </div>
                 ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                          {quotaCards.map((quota) => (
-                              <div
-                                  key={quota.id}
-                                  className="bg-white dark:bg-surface-dark rounded-2xl border border-gray-200 dark:border-border-dark shadow-sm p-5 flex flex-col gap-4"
-                              >
-                                <div className="flex items-start gap-3">
-                                    <span className="px-3 py-1 rounded-full text-xs font-semibold tracking-wide bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">
-                                        {quota.typeLabel}
-                                    </span>
-                                      <div className="flex-1 text-base font-semibold text-slate-900 dark:text-white break-all">
-                                          {quota.auth_key}
-                                      </div>
-                                  </div>
-                                  {requiresAuthRelogin(quota.auth_status) ? (() => {
-                                      const statusMessage = toStringValue(quota.auth_status?.message)
-                                          || t('Auth token expired, need re-login');
-                                      const statusDetail = toStringValue(quota.auth_status?.detail);
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            {quotaCards.map((quota) => {
+                                const pollingDisabled = isQuotaPollingDisabled(quota);
+                                const pollingDisabledLabel =
+                                    toStringValue(quota.quota_polling_status_label) || t('Quota polling disabled');
+                                return (
+                                <div
+                                    key={quota.id}
+                                    className="bg-white dark:bg-surface-dark rounded-2xl border border-gray-200 dark:border-border-dark shadow-sm p-5 flex flex-col gap-4"
+                                >
+                                  <div className="flex items-start gap-3">
+                                      <span className="px-3 py-1 rounded-full text-xs font-semibold tracking-wide bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">
+                                          {quota.typeLabel}
+                                      </span>
+                                      {pollingDisabled ? (
+                                          <span className="px-3 py-1 rounded-full text-xs font-semibold tracking-wide bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-200">
+                                              {pollingDisabledLabel}
+                                          </span>
+                                      ) : null}
+                                        <div className="flex-1 text-base font-semibold text-slate-900 dark:text-white break-all">
+                                            {quota.auth_key}
+                                        </div>
+                                    </div>
+                                    {pollingDisabled ? (
+                                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200">
+                                            <div className="flex items-start gap-2">
+                                                <Icon name="pause_circle" size={18} className="mt-0.5 shrink-0" />
+                                                <div className="min-w-0 space-y-1">
+                                                    <div className="text-sm font-semibold">
+                                                        {pollingDisabledLabel}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ) : requiresAuthRelogin(quota.auth_status) ? (() => {
+                                        const statusMessage = toStringValue(quota.auth_status?.message)
+                                            || t('Auth token expired, need re-login');
+                                        const statusDetail = toStringValue(quota.auth_status?.detail);
                                       const checkedAtLabel = formatQuotaTime(
                                           toStringValue(quota.auth_status?.checked_at),
                                           i18n.language
@@ -1238,9 +1265,10 @@ export function AdminQuotas() {
                                         })
                                     )}
                                 </AutoScrollList>
-                            </div>
-                        ))}
-                    </div>
+                              </div>
+                          );
+                      })}
+                      </div>
                 )}
 
                 <div className="bg-white dark:bg-surface-dark rounded-xl border border-gray-200 dark:border-border-dark shadow-sm px-6 py-4 flex items-center justify-between">

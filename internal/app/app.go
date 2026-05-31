@@ -159,7 +159,7 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 				relayhttp.CLIProxyModelsMiddleware(conn, modelStore),
 			),
 			sdkapi.WithRouterConfigurator(func(engine *gin.Engine, baseHandler *sdkhandlers.BaseAPIHandler, cfg *sdkconfig.Config) {
-				internalhttp.RegisterAdminRoutes(engine, conn, jwtConfig, configPath, cfg, baseHandler, authRateLimiter)
+				internalhttp.RegisterAdminRoutes(engine, conn, jwtConfig, configPath, cfg, baseHandler, authRateLimiter, coreManager)
 				front.RegisterFrontRoutes(engine, conn, jwtConfig, modelStore, authRateLimiter)
 				engine.StaticFS("/assets", webBundle.AssetsFS)
 				engine.GET("/v0/init/status", func(c *gin.Context) {

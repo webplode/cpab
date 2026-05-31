@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	dbutil "github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	quotapkg "github.com/router-for-me/CLIProxyAPIBusiness/internal/quota"
 	"gorm.io/datatypes"
@@ -18,12 +19,13 @@ import (
 
 // QuotaHandler handles admin quota endpoints.
 type QuotaHandler struct {
-	db *gorm.DB
+	db      *gorm.DB
+	manager *coreauth.Manager
 }
 
 // NewQuotaHandler constructs a QuotaHandler.
-func NewQuotaHandler(db *gorm.DB) *QuotaHandler {
-	return &QuotaHandler{db: db}
+func NewQuotaHandler(db *gorm.DB, manager *coreauth.Manager) *QuotaHandler {
+	return &QuotaHandler{db: db, manager: manager}
 }
 
 // quotaListQuery defines filters for the quota list view.
@@ -37,13 +39,18 @@ type quotaListQuery struct {
 
 // quotaListRow defines the query result row for quota list.
 type quotaListRow struct {
-	ID          uint64         `gorm:"column:id"`
-	AuthID      uint64         `gorm:"column:auth_id"`
-	Type        string         `gorm:"column:type"`
-	Data        datatypes.JSON `gorm:"column:data"`
-	UpdatedAt   time.Time      `gorm:"column:updated_at"`
-	AuthKey     string         `gorm:"column:auth_key"`
-	AuthContent datatypes.JSON `gorm:"column:auth_content"`
+	ID            uint64         `gorm:"column:id"`
+	AuthID        uint64         `gorm:"column:auth_id"`
+	Type          string         `gorm:"column:type"`
+	Data          datatypes.JSON `gorm:"column:data"`
+	UpdatedAt     time.Time      `gorm:"column:updated_at"`
+	AuthKey       string         `gorm:"column:auth_key"`
+	AuthContent   datatypes.JSON `gorm:"column:auth_content"`
+	AuthAvailable bool           `gorm:"column:auth_available"`
+}
+
+type forceQuotaCheckRequest struct {
+	AuthIDs []uint64 `json:"auth_ids"`
 }
 
 // List returns quota records with paging and filters.
@@ -114,7 +121,7 @@ func (h *QuotaHandler) List(c *gin.Context) {
 	offset := (q.Page - 1) * q.Limit
 	var rows []quotaListRow
 	if errFind := base.
-		Select("quota.id, quota.auth_id, quota.type, quota.data, quota.updated_at, auths.key AS auth_key, auths.content AS auth_content").
+		Select("quota.id, quota.auth_id, quota.type, quota.data, quota.updated_at, auths.key AS auth_key, auths.content AS auth_content, auths.is_available AS auth_available").
 		Order("auths.id ASC, quota.updated_at DESC").
 		Offset(offset).
 		Limit(q.Limit).
@@ -137,6 +144,13 @@ func (h *QuotaHandler) List(c *gin.Context) {
 			"data":       payload,
 			"updated_at": row.UpdatedAt,
 		}
+		entry["auth_available"] = row.AuthAvailable
+		if row.AuthAvailable {
+			entry["quota_polling_status"] = "active"
+		} else {
+			entry["quota_polling_status"] = "disabled"
+			entry["quota_polling_status_label"] = "Quota polling disabled"
+		}
 		if authStatus != nil {
 			entry["auth_status"] = authStatus
 		}
@@ -155,6 +169,46 @@ func (h *QuotaHandler) List(c *gin.Context) {
 		"total":  total,
 		"page":   q.Page,
 		"limit":  q.Limit,
+	})
+}
+
+// ForceCheck immediately checks quota for selected auth files.
+func (h *QuotaHandler) ForceCheck(c *gin.Context) {
+	if h == nil || h.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota handler unavailable"})
+		return
+	}
+	if h.manager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota manager unavailable"})
+		return
+	}
+
+	var body forceQuotaCheckRequest
+	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+
+	poller := quotapkg.NewPoller(h.db, h.manager)
+	if poller == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota poller unavailable"})
+		return
+	}
+	result, errCheck := poller.ForceCheckAuthIDs(c.Request.Context(), body.AuthIDs)
+	if errCheck != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(errCheck.Error(), "no auth ids selected") {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": errCheck.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"requested": result.Requested,
+		"checked":   result.Checked,
+		"skipped":   result.Skipped,
+		"missing":   result.Missing,
 	})
 }
 

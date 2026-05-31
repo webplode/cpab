@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	sdkapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
 	relayhttp "github.com/router-for-me/CLIProxyAPIBusiness/internal/http"
@@ -19,7 +20,7 @@ import (
 )
 
 // RegisterAdminRoutes registers admin routes, middleware, and handlers.
-func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, configPath string, cfg *sdkconfig.Config, baseHandler *sdkhandlers.BaseAPIHandler, authRateLimiter *ratelimit.Manager) {
+func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, configPath string, cfg *sdkconfig.Config, baseHandler *sdkhandlers.BaseAPIHandler, authRateLimiter *ratelimit.Manager, coreManager *coreauth.Manager) {
 	if r == nil || db == nil {
 		return
 	}
@@ -122,8 +123,9 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	authed.POST("/auth-files/:id/unavailable", authFileHandler.SetUnavailable)
 	authed.GET("/auth-files/types", authFileHandler.ListTypes)
 
-	quotaHandler := handlers.NewQuotaHandler(db)
+	quotaHandler := handlers.NewQuotaHandler(db, coreManager)
 	authed.GET("/quotas", quotaHandler.List)
+	authed.POST("/quotas/check", quotaHandler.ForceCheck)
 
 	userGroupHandler := handlers.NewUserGroupHandler(db)
 	authed.POST("/user-groups", userGroupHandler.Create)
