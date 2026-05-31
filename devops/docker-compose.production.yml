@@ -1,0 +1,65 @@
+name: cpab-production
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: cpab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cpab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment or a .env file}
+      POSTGRES_DB: ${POSTGRES_DB:-cpab}
+    volumes:
+      - cpab-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cpab} -d ${POSTGRES_DB:-cpab}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cpab-internal
+
+  cpab:
+    image: abwebplode/cpab:development
+    container_name: cpab
+    restart: unless-stopped
+    pull_policy: always
+    environment:
+      DB_CONNECTION: "postgres://${POSTGRES_USER:-cpab}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment or a .env file}@postgres:5432/${POSTGRES_DB:-cpab}?sslmode=disable"
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://openapi.io.vn}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET to a strong random value}
+      JWT_EXPIRY: ${JWT_EXPIRY:-720h}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8318/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    expose:
+      - "8318"
+    networks:
+      - cpab-internal
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: cpab-nginx
+    restart: unless-stopped
+    depends_on:
+      cpab:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx/openapi.io.vn.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - cpab-internal
+
+networks:
+  cpab-internal:
+    driver: bridge
+
+volumes:
+  cpab-postgres-data:
