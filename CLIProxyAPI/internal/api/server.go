@@ -53,6 +53,7 @@ type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
 	engineConfigurator   func(*gin.Engine)
 	routerConfigurator   func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
+	healthzHandler       gin.HandlerFunc
 	requestLoggerFactory func(*config.Config, string) logging.RequestLogger
 	localPassword        string
 	keepAliveEnabled     bool
@@ -90,6 +91,13 @@ func WithEngineConfigurator(fn func(*gin.Engine)) ServerOption {
 func WithRouterConfigurator(fn func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.routerConfigurator = fn
+	}
+}
+
+// WithHealthzHandler replaces the default /healthz route handler.
+func WithHealthzHandler(fn gin.HandlerFunc) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.healthzHandler = fn
 	}
 }
 
@@ -184,6 +192,8 @@ type Server struct {
 	// envManagementSecret indicates whether MANAGEMENT_PASSWORD is configured.
 	envManagementSecret bool
 
+	healthzHandler gin.HandlerFunc
+
 	localPassword string
 
 	keepAliveEnabled   bool
@@ -265,6 +275,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		configFilePath:      configFilePath,
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
+		healthzHandler:      optionState.healthzHandler,
 		wsRoutes:            make(map[string]struct{}),
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
@@ -367,6 +378,9 @@ func (s *Server) setupRoutes() {
 		}
 
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	}
+	if s.healthzHandler != nil {
+		healthzHandler = s.healthzHandler
 	}
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)

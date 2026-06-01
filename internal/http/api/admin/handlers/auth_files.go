@@ -17,6 +17,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	dbutil "github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
+	quotapkg "github.com/router-for-me/CLIProxyAPIBusiness/internal/quota"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -24,12 +25,17 @@ import (
 
 // AuthFileHandler manages auth file endpoints.
 type AuthFileHandler struct {
-	db *gorm.DB
+	db      *gorm.DB
+	manager *cliproxyauth.Manager
 }
 
 // NewAuthFileHandler constructs an AuthFileHandler.
-func NewAuthFileHandler(db *gorm.DB) *AuthFileHandler {
-	return &AuthFileHandler{db: db}
+func NewAuthFileHandler(db *gorm.DB, managers ...*cliproxyauth.Manager) *AuthFileHandler {
+	var manager *cliproxyauth.Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	return &AuthFileHandler{db: db, manager: manager}
 }
 
 // createAuthFileRequest defines the request body for auth file creation.
@@ -60,6 +66,24 @@ type authImportEntry struct {
 
 type idListRequest struct {
 	IDs []uint64 `json:"ids"`
+}
+
+const (
+	authHealthStateHealthy            = "healthy"
+	authHealthStateExpired            = "expired"
+	authHealthStateInvalidContent     = "invalid_content"
+	authHealthStateMissingCredentials = "missing_credentials"
+	authHealthStateNeedsRelogin       = "needs_relogin"
+	authHealthStatePollFailed         = "poll_failed"
+	authHealthStateRefreshFailed      = "refresh_failed"
+	authHealthStateUnknown            = "unknown"
+	authHealthStateUnsupported        = "unsupported"
+)
+
+type authHealthComputation struct {
+	Health   gin.H
+	Status   *quotapkg.AuthStatus
+	Provider string
 }
 
 // Create creates a new auth file entry.
@@ -450,6 +474,11 @@ func (h *AuthFileHandler) List(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "load auth groups failed"})
 		return
 	}
+	statusMap, errStatuses := loadLatestAuthStatusMap(c.Request.Context(), h.db, rows)
+	if errStatuses != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load auth health failed"})
+		return
+	}
 
 	out := make([]gin.H, 0, len(rows))
 	for _, row := range rows {
@@ -467,6 +496,7 @@ func (h *AuthFileHandler) List(c *gin.Context) {
 			"updated_at":    row.UpdatedAt,
 		}
 		item["auth_group"] = buildAuthGroupSummaries(authGroupIDs, groupMap)
+		item["auth_health"] = h.deriveAuthHealth(row, statusMap[row.ID], time.Time{}, "stored").Health
 		out = append(out, item)
 	}
 	c.JSON(http.StatusOK, gin.H{"auth_files": out})
@@ -496,6 +526,11 @@ func (h *AuthFileHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "load auth groups failed"})
 		return
 	}
+	status, errStatus := loadLatestAuthStatus(c.Request.Context(), h.db, auth.ID)
+	if errStatus != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load auth health failed"})
+		return
+	}
 	item := gin.H{
 		"id":            auth.ID,
 		"key":           auth.Key,
@@ -509,6 +544,7 @@ func (h *AuthFileHandler) Get(c *gin.Context) {
 		"updated_at":    auth.UpdatedAt,
 	}
 	item["auth_group"] = buildAuthGroupSummaries(authGroupIDs, groupMap)
+	item["auth_health"] = h.deriveAuthHealth(auth, status, time.Time{}, "stored").Health
 	c.JSON(http.StatusOK, item)
 }
 
@@ -646,6 +682,142 @@ func (h *AuthFileHandler) BatchDelete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"deleted":     deleted,
 		"missing_ids": missingIDs,
+	})
+}
+
+// LivenessCheck derives current auth health without refreshing or mutating tokens.
+func (h *AuthFileHandler) LivenessCheck(c *gin.Context) {
+	auth, ok := h.loadAuthRowParam(c)
+	if !ok {
+		return
+	}
+
+	now := time.Now().UTC()
+	computed := h.deriveAuthHealth(auth, nil, now, "liveness_check")
+	if errSave := h.saveAuthHealthStatus(c.Request.Context(), auth, computed.Status); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "save auth health failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"auth_health": computed.Health,
+	})
+}
+
+// Refresh explicitly refreshes provider tokens for a supported auth file.
+func (h *AuthFileHandler) Refresh(c *gin.Context) {
+	authRow, ok := h.loadAuthRowParam(c)
+	if !ok {
+		return
+	}
+
+	metadata, errMetadata := authMetadataFromContent(authRow.Content)
+	if errMetadata != nil {
+		computed := h.authHealthWithState(authRow, authHealthStateInvalidContent, "Invalid auth content", time.Now().UTC(), "refresh")
+		_ = h.saveAuthHealthStatus(c.Request.Context(), authRow, computed.Status)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":       "invalid auth content",
+			"auth_health": computed.Health,
+		})
+		return
+	}
+
+	provider := authProviderFromPayload(metadata)
+	if provider == "" {
+		computed := h.authHealthWithState(authRow, authHealthStateUnsupported, "Refresh unsupported for auth without provider", time.Now().UTC(), "refresh")
+		_ = h.saveAuthHealthStatus(c.Request.Context(), authRow, computed.Status)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":       "unsupported auth provider",
+			"auth_health": computed.Health,
+		})
+		return
+	}
+	if !hasRefreshCredential(metadata) {
+		computed := h.authHealthWithState(authRow, authHealthStateUnsupported, "Refresh token not present", time.Now().UTC(), "refresh")
+		_ = h.saveAuthHealthStatus(c.Request.Context(), authRow, computed.Status)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":       "refresh token not present",
+			"auth_health": computed.Health,
+		})
+		return
+	}
+
+	executor, okExecutor := h.authExecutor(provider)
+	if !okExecutor {
+		computed := h.authHealthWithState(authRow, authHealthStateUnsupported, "Refresh unsupported for provider", time.Now().UTC(), "refresh")
+		_ = h.saveAuthHealthStatus(c.Request.Context(), authRow, computed.Status)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":       "refresh unsupported for provider",
+			"auth_health": computed.Health,
+		})
+		return
+	}
+
+	runtimeAuth := authRowToRuntimeAuth(authRow, metadata, provider)
+	refreshed, errRefresh := executor.Refresh(c.Request.Context(), runtimeAuth.Clone())
+	if errRefresh != nil {
+		computed := h.authHealthWithState(authRow, authHealthStateRefreshFailed, "Refresh failed", time.Now().UTC(), "refresh")
+		if status := statusCodeFromError(errRefresh); status > 0 {
+			computed.Status.HTTPStatus = status
+			computed.Health["http_status"] = status
+		}
+		_ = h.saveAuthHealthStatus(c.Request.Context(), authRow, computed.Status)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":       "refresh failed",
+			"auth_health": computed.Health,
+		})
+		return
+	}
+	if refreshed == nil {
+		refreshed = runtimeAuth
+	}
+
+	updatedContent, errContent := mergeRefreshedAuthContent(authRow.Content, metadata, refreshed, provider)
+	if errContent != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal refreshed auth failed"})
+		return
+	}
+
+	now := time.Now().UTC()
+	if !jsonEqual(authRow.Content, updatedContent) {
+		if errUpdate := h.db.WithContext(c.Request.Context()).
+			Model(&models.Auth{}).
+			Where("id = ?", authRow.ID).
+			Updates(map[string]any{
+				"content":    datatypes.JSON(updatedContent),
+				"updated_at": now,
+			}).Error; errUpdate != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "persist refreshed auth failed"})
+			return
+		}
+		authRow.Content = datatypes.JSON(updatedContent)
+		authRow.UpdatedAt = now
+	}
+
+	if authRow.IsAvailable && h.manager != nil {
+		refreshed.ID = authRow.Key
+		refreshed.Provider = provider
+		refreshed.FileName = authRow.Key
+		refreshed.ProxyURL = authRow.ProxyURL
+		if _, errUpdate := h.manager.Update(cliproxyauth.WithSkipPersist(c.Request.Context()), refreshed); errUpdate != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "update runtime auth failed"})
+			return
+		}
+	}
+
+	computed := h.deriveAuthHealth(authRow, &quotapkg.AuthStatus{
+		State:        authHealthStateHealthy,
+		CheckedAt:    now,
+		NeedsRelogin: false,
+	}, now, "refresh")
+	if errSave := h.saveAuthHealthStatus(c.Request.Context(), authRow, computed.Status); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "save auth health failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"auth_health": computed.Health,
+		"refreshed":   true,
 	})
 }
 
@@ -959,6 +1131,462 @@ func missingUint64IDs(requested []uint64, existing []uint64) []uint64 {
 		}
 	}
 	return missing
+}
+
+func (h *AuthFileHandler) loadAuthRowParam(c *gin.Context) (models.Auth, bool) {
+	id, errParse := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
+	if errParse != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return models.Auth{}, false
+	}
+
+	var auth models.Auth
+	if errFind := h.db.WithContext(c.Request.Context()).First(&auth, id).Error; errFind != nil {
+		if errors.Is(errFind, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return models.Auth{}, false
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+		return models.Auth{}, false
+	}
+	return auth, true
+}
+
+func loadLatestAuthStatusMap(ctx context.Context, db *gorm.DB, rows []models.Auth) (map[uint64]*quotapkg.AuthStatus, error) {
+	out := make(map[uint64]*quotapkg.AuthStatus)
+	if db == nil || len(rows) == 0 {
+		return out, nil
+	}
+	ids := make([]uint64, 0, len(rows))
+	for _, row := range rows {
+		if row.ID != 0 {
+			ids = append(ids, row.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	var quotas []models.Quota
+	if errFind := db.WithContext(ctx).
+		Where("auth_id IN ?", ids).
+		Order("auth_id ASC, updated_at DESC, id DESC").
+		Find(&quotas).Error; errFind != nil {
+		return nil, errFind
+	}
+	for _, quota := range quotas {
+		if _, exists := out[quota.AuthID]; exists {
+			continue
+		}
+		_, status := quotapkg.UnwrapStoredQuotaData(quota.Data)
+		if status != nil {
+			out[quota.AuthID] = status
+		}
+	}
+	return out, nil
+}
+
+func loadLatestAuthStatus(ctx context.Context, db *gorm.DB, authID uint64) (*quotapkg.AuthStatus, error) {
+	if authID == 0 {
+		return nil, nil
+	}
+	statuses, errStatuses := loadLatestAuthStatusMap(ctx, db, []models.Auth{{ID: authID}})
+	if errStatuses != nil {
+		return nil, errStatuses
+	}
+	return statuses[authID], nil
+}
+
+func (h *AuthFileHandler) deriveAuthHealth(row models.Auth, persisted *quotapkg.AuthStatus, checkedAt time.Time, source string) authHealthComputation {
+	now := time.Now().UTC()
+	payload, errPayload := authMetadataFromContent(row.Content)
+	provider := authProviderFromPayload(payload)
+	hasRefreshToken := hasRefreshCredential(payload)
+	hasCredential := hasCredentialMaterial(payload)
+	refreshSupported := false
+	if hasRefreshToken {
+		_, refreshSupported = h.authExecutor(provider)
+	}
+	runtimeLoaded := false
+	if h != nil && h.manager != nil {
+		_, runtimeLoaded = h.manager.GetByID(row.Key)
+	}
+
+	if source == "" {
+		source = "derived"
+	}
+	if checkedAt.IsZero() && persisted != nil {
+		checkedAt = persisted.CheckedAt
+	}
+
+	state := authHealthStateUnknown
+	message := "Unknown"
+	needsRelogin := false
+	httpStatus := 0
+	if persisted != nil && persisted.HTTPStatus > 0 {
+		httpStatus = persisted.HTTPStatus
+	}
+
+	var expiresAt string
+	var expiry time.Time
+	var hasExpiry bool
+	var lastRefresh string
+	var hasLastRefresh bool
+	if errPayload == nil {
+		candidates := collectAuthMetadataCandidates(payload)
+		expiresAt, expiry, hasExpiry = findFirstTimeCandidate(candidates,
+			"expired",
+			"expire",
+			"expires_at",
+			"expiresAt",
+			"expiry",
+			"expires",
+		)
+		lastRefresh, _, hasLastRefresh = findFirstTimeCandidate(candidates,
+			"last_refresh",
+			"lastRefresh",
+			"last_refreshed_at",
+			"lastRefreshedAt",
+		)
+	}
+
+	switch {
+	case errPayload != nil:
+		state = authHealthStateInvalidContent
+		message = "Invalid auth content"
+		needsRelogin = true
+	case provider == "":
+		state = authHealthStateUnsupported
+		message = "Provider not detected"
+	case !hasCredential:
+		state = authHealthStateMissingCredentials
+		message = "Credential material missing"
+		needsRelogin = true
+	case hasExpiry && !expiry.IsZero() && !expiry.After(now):
+		state = authHealthStateExpired
+		message = "Token expired"
+		needsRelogin = true
+	case persisted != nil && (persisted.NeedsRelogin || strings.EqualFold(persisted.State, authHealthStateNeedsRelogin)):
+		state = authHealthStateNeedsRelogin
+		message = "Needs re-login"
+		needsRelogin = true
+	case persisted != nil && strings.EqualFold(persisted.State, authHealthStatePollFailed):
+		state = authHealthStatePollFailed
+		message = "Last health check failed"
+	case persisted != nil && strings.EqualFold(persisted.State, authHealthStateRefreshFailed):
+		state = authHealthStateRefreshFailed
+		message = "Refresh failed"
+	case hasCredential:
+		state = authHealthStateHealthy
+		message = "Healthy"
+	}
+
+	health := gin.H{
+		"state":              state,
+		"message":            message,
+		"has_refresh_token":  hasRefreshToken,
+		"refresh_supported":  refreshSupported,
+		"liveness_supported": true,
+		"runtime_loaded":     runtimeLoaded,
+		"source":             source,
+	}
+	if provider != "" {
+		health["provider"] = provider
+	}
+	if !checkedAt.IsZero() {
+		health["checked_at"] = checkedAt.UTC()
+	}
+	if hasExpiry && expiresAt != "" {
+		health["expires_at"] = expiresAt
+	}
+	if hasLastRefresh && lastRefresh != "" {
+		health["last_refresh"] = lastRefresh
+	}
+	if httpStatus > 0 {
+		health["http_status"] = httpStatus
+	}
+	if needsRelogin {
+		health["needs_relogin"] = true
+	}
+
+	statusCheckedAt := checkedAt
+	if statusCheckedAt.IsZero() {
+		statusCheckedAt = now
+	}
+	status := &quotapkg.AuthStatus{
+		State:        state,
+		Message:      message,
+		CheckedAt:    statusCheckedAt.UTC(),
+		HTTPStatus:   httpStatus,
+		NeedsRelogin: needsRelogin,
+	}
+	return authHealthComputation{Health: health, Status: status, Provider: provider}
+}
+
+func (h *AuthFileHandler) authHealthWithState(row models.Auth, state, message string, checkedAt time.Time, source string) authHealthComputation {
+	computed := h.deriveAuthHealth(row, nil, checkedAt, source)
+	computed.Health["state"] = state
+	computed.Health["message"] = message
+	computed.Status.State = state
+	computed.Status.Message = message
+	computed.Status.CheckedAt = checkedAt.UTC()
+	computed.Status.NeedsRelogin = state == authHealthStateExpired ||
+		state == authHealthStateInvalidContent ||
+		state == authHealthStateMissingCredentials ||
+		state == authHealthStateNeedsRelogin
+	if computed.Status.NeedsRelogin {
+		computed.Health["needs_relogin"] = true
+	} else {
+		delete(computed.Health, "needs_relogin")
+	}
+	return computed
+}
+
+func (h *AuthFileHandler) authExecutor(provider string) (cliproxyauth.ProviderExecutor, bool) {
+	if h == nil || h.manager == nil {
+		return nil, false
+	}
+	provider = normalizeAuthProvider(provider)
+	if provider == "" {
+		return nil, false
+	}
+	return h.manager.Executor(provider)
+}
+
+func (h *AuthFileHandler) saveAuthHealthStatus(ctx context.Context, row models.Auth, status *quotapkg.AuthStatus) error {
+	if h == nil || h.db == nil || status == nil || row.ID == 0 {
+		return nil
+	}
+	authType := authProviderFromContent(row.Content)
+	if authType == "" {
+		authType = "unknown"
+	}
+	now := time.Now().UTC()
+
+	var existing models.Quota
+	errFind := h.db.WithContext(ctx).
+		Where("auth_id = ? AND type = ?", row.ID, authType).
+		First(&existing).Error
+	var payload []byte
+	switch {
+	case errFind == nil:
+		unwrapped, _ := quotapkg.UnwrapStoredQuotaData(existing.Data)
+		payload = unwrapped
+	case errors.Is(errFind, gorm.ErrRecordNotFound):
+		payload = nil
+	default:
+		return errFind
+	}
+
+	stored, errMarshal := quotapkg.MarshalStoredQuotaData(payload, status)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	if errFind == nil {
+		return h.db.WithContext(ctx).
+			Model(&models.Quota{}).
+			Where("id = ?", existing.ID).
+			Updates(map[string]any{
+				"data":       datatypes.JSON(stored),
+				"updated_at": now,
+			}).Error
+	}
+	return h.db.WithContext(ctx).Create(&models.Quota{
+		AuthID:    row.ID,
+		Type:      authType,
+		Data:      datatypes.JSON(stored),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}).Error
+}
+
+func authMetadataFromContent(content datatypes.JSON) (map[string]any, error) {
+	if len(content) == 0 {
+		return nil, errors.New("empty auth content")
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(content, &payload); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	if payload == nil {
+		return nil, errors.New("empty auth content")
+	}
+	return payload, nil
+}
+
+func authProviderFromContent(content datatypes.JSON) string {
+	payload, errPayload := authMetadataFromContent(content)
+	if errPayload != nil {
+		return ""
+	}
+	return authProviderFromPayload(payload)
+}
+
+func authProviderFromPayload(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	provider := strings.TrimSpace(stringValue(payload["provider"]))
+	if provider == "" {
+		provider = strings.TrimSpace(stringValue(payload["type"]))
+	}
+	return normalizeAuthProvider(provider)
+}
+
+func normalizeAuthProvider(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	provider = strings.ReplaceAll(provider, "_", "-")
+	return provider
+}
+
+func hasRefreshCredential(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	return findFirstStringCandidate(collectAuthMetadataCandidates(payload), "refresh_token", "refreshToken") != ""
+}
+
+func hasCredentialMaterial(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	candidates := collectAuthMetadataCandidates(payload)
+	if findFirstStringCandidate(candidates,
+		"access_token",
+		"accessToken",
+		"id_token",
+		"idToken",
+		"refresh_token",
+		"refreshToken",
+		"api_key",
+		"apiKey",
+		"token",
+		"cookie",
+		"session_id",
+		"sessionId",
+	) != "" {
+		return true
+	}
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		for _, key := range []string{"cookies", "credentials"} {
+			if value, ok := candidate[key]; ok && value != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func authRowToRuntimeAuth(row models.Auth, metadata map[string]any, provider string) *cliproxyauth.Auth {
+	attrs := map[string]string{}
+	if email, ok := metadata["email"].(string); ok && strings.TrimSpace(email) != "" {
+		attrs["email"] = strings.TrimSpace(email)
+	}
+	if row.Priority != 0 {
+		attrs["priority"] = strconv.Itoa(row.Priority)
+	}
+	return &cliproxyauth.Auth{
+		ID:         row.Key,
+		Provider:   provider,
+		FileName:   row.Key,
+		ProxyURL:   row.ProxyURL,
+		Label:      labelForAuthPayload(metadata),
+		Status:     cliproxyauth.StatusActive,
+		Attributes: attrs,
+		Metadata:   cloneStringAnyMap(metadata),
+		CreatedAt:  row.CreatedAt,
+		UpdatedAt:  row.UpdatedAt,
+	}
+}
+
+func mergeRefreshedAuthContent(existing datatypes.JSON, original map[string]any, refreshed *cliproxyauth.Auth, provider string) ([]byte, error) {
+	merged := cloneStringAnyMap(original)
+	if len(merged) == 0 {
+		var err error
+		merged, err = authMetadataFromContent(existing)
+		if err != nil {
+			merged = make(map[string]any)
+		}
+	}
+	if refreshed != nil && refreshed.Metadata != nil {
+		for key, value := range refreshed.Metadata {
+			merged[key] = value
+		}
+	}
+	if strings.TrimSpace(stringValue(merged["type"])) == "" && provider != "" {
+		merged["type"] = provider
+	}
+	return json.Marshal(merged)
+}
+
+func cloneStringAnyMap(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func labelForAuthPayload(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(stringValue(metadata["label"])); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(stringValue(metadata["email"])); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(stringValue(metadata["project_id"])); value != "" {
+		return value
+	}
+	return ""
+}
+
+func jsonEqual(a, b []byte) bool {
+	var objA, objB map[string]any
+	if errA := json.Unmarshal(a, &objA); errA != nil {
+		return false
+	}
+	if errB := json.Unmarshal(b, &objB); errB != nil {
+		return false
+	}
+	if len(objA) != len(objB) {
+		return false
+	}
+	for key, valueA := range objA {
+		valueB, ok := objB[key]
+		if !ok {
+			return false
+		}
+		jsonA, _ := json.Marshal(valueA)
+		jsonB, _ := json.Marshal(valueB)
+		if string(jsonA) != string(jsonB) {
+			return false
+		}
+	}
+	return true
+}
+
+type statusCoder interface {
+	StatusCode() int
+}
+
+func statusCodeFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	var coder statusCoder
+	if errors.As(err, &coder) && coder != nil {
+		return coder.StatusCode()
+	}
+	return 0
 }
 
 func authContentForResponse(content datatypes.JSON) any {

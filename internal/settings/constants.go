@@ -6,6 +6,10 @@ const (
 	SiteNameKey = "SITE_NAME"
 	// DefaultSiteName is the fallback UI site name.
 	DefaultSiteName = "CLIProxyAPI"
+	// PortalRegistrationEnabledKey toggles public portal user registration.
+	PortalRegistrationEnabledKey = "PORTAL_REGISTRATION_ENABLED"
+	// DefaultPortalRegistrationEnabled preserves existing open registration behavior.
+	DefaultPortalRegistrationEnabled = true
 	// QuotaPollIntervalSecondsKey controls the quota poll interval in seconds.
 	QuotaPollIntervalSecondsKey = "QUOTA_POLL_INTERVAL_SECONDS"
 	// QuotaPollMaxConcurrencyKey controls the max concurrent quota requests.

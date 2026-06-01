@@ -43,6 +43,11 @@ const SETTINGS_CATALOG: SettingDefinition[] = [
         description: 'Site name displayed in UI.',
     },
     {
+        key: 'PORTAL_REGISTRATION_ENABLED',
+        type: 'boolean',
+        description: 'Allow visitors to create portal user accounts.',
+    },
+    {
         key: 'WEB_AUTHN_ORIGIN',
         type: 'string',
         description: 'WebAuthn origin for passkey verification.',

@@ -231,7 +231,7 @@ func (h *UserHandler) Update(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// Delete removes a user account and its API keys.
+// Delete removes a user account and related user-owned records.
 func (h *UserHandler) Delete(c *gin.Context) {
 	id, errParse := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
 	if errParse != nil {
@@ -241,31 +241,113 @@ func (h *UserHandler) Delete(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	var user models.User
-	if errFind := h.db.WithContext(ctx).First(&user, id).Error; errFind != nil {
-		if errors.Is(errFind, gorm.ErrRecordNotFound) {
+	errTx := h.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		existingIDs, errExisting := loadExistingIDs(tx, &models.User{}, []uint64{id})
+		if errExisting != nil {
+			return errExisting
+		}
+		if len(existingIDs) == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		_, errDelete := deleteUsersByIDs(tx, existingIDs)
+		return errDelete
+	})
+	if errTx != nil {
+		if errors.Is(errTx, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
-		return
-	}
-
-	errTx := h.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if errDelKeys := tx.Where("user_id = ?", id).Delete(&models.APIKey{}).Error; errDelKeys != nil {
-			return errDelKeys
-		}
-		if errDelUser := tx.Delete(&models.User{}, id).Error; errDelUser != nil {
-			return errDelUser
-		}
-		return nil
-	})
-	if errTx != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
 		return
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+// BatchDelete removes selected user accounts and related user-owned records.
+func (h *UserHandler) BatchDelete(c *gin.Context) {
+	ids, ok := bindRequestIDList(c)
+	if !ok {
+		return
+	}
+
+	var (
+		deleted    int64
+		missingIDs []uint64
+	)
+	errTx := h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		existingIDs, errExisting := loadExistingIDs(tx, &models.User{}, ids)
+		if errExisting != nil {
+			return errExisting
+		}
+		missingIDs = missingUint64IDs(ids, existingIDs)
+		if len(existingIDs) == 0 {
+			return nil
+		}
+		var errDelete error
+		deleted, errDelete = deleteUsersByIDs(tx, existingIDs)
+		return errDelete
+	})
+	if errTx != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "batch delete users failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"deleted":     deleted,
+		"missing_ids": missingIDs,
+	})
+}
+
+func deleteUsersByIDs(tx *gorm.DB, userIDs []uint64) (int64, error) {
+	if len(userIDs) == 0 {
+		return 0, nil
+	}
+
+	var apiKeyIDs []uint64
+	if errKeys := tx.Model(&models.APIKey{}).
+		Where("user_id IN ?", userIDs).
+		Pluck("id", &apiKeyIDs).Error; errKeys != nil {
+		return 0, errKeys
+	}
+
+	usageQuery := tx.Model(&models.Usage{}).Where("user_id IN ?", userIDs)
+	if len(apiKeyIDs) > 0 {
+		usageQuery = usageQuery.Or("api_key_id IN ?", apiKeyIDs)
+	}
+	if errUsage := usageQuery.Updates(map[string]any{
+		"user_id":    nil,
+		"api_key_id": nil,
+	}).Error; errUsage != nil {
+		return 0, errUsage
+	}
+
+	if errPrepaid := tx.Model(&models.PrepaidCard{}).
+		Where("redeemed_user_id IN ?", userIDs).
+		Updates(map[string]any{"redeemed_user_id": nil}).Error; errPrepaid != nil {
+		return 0, errPrepaid
+	}
+
+	if errBindings := tx.Where("user_id IN ?", userIDs).
+		Delete(&models.UserModelAuthBinding{}).Error; errBindings != nil {
+		return 0, errBindings
+	}
+
+	if errBills := tx.Where("user_id IN ?", userIDs).
+		Delete(&models.Bill{}).Error; errBills != nil {
+		return 0, errBills
+	}
+
+	if errKeys := tx.Where("user_id IN ?", userIDs).
+		Delete(&models.APIKey{}).Error; errKeys != nil {
+		return 0, errKeys
+	}
+
+	res := tx.Delete(&models.User{}, "id IN ?", userIDs)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return res.RowsAffected, nil
 }
 
 // Disable deactivates a user account.

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/security"
+	internalsettings "github.com/router-for-me/CLIProxyAPIBusiness/internal/settings"
 	"gorm.io/gorm"
 )
 
@@ -33,6 +35,16 @@ type registerRequest struct {
 
 // Register creates a new user account.
 func (h *AuthHandler) Register(c *gin.Context) {
+	registrationEnabled, errRegistrationEnabled := h.portalRegistrationEnabled(c.Request.Context())
+	if errRegistrationEnabled != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query registration setting failed"})
+		return
+	}
+	if !registrationEnabled {
+		c.JSON(http.StatusForbidden, gin.H{"error": "registration is disabled"})
+		return
+	}
+
 	var body registerRequest
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
@@ -93,6 +105,28 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		"username": user.Username,
 		"email":    user.Email,
 	})
+}
+
+func (h *AuthHandler) portalRegistrationEnabled(ctx context.Context) (bool, error) {
+	if raw, ok := internalsettings.DBConfigValue(internalsettings.PortalRegistrationEnabledKey); ok {
+		return parseDBConfigBoolWithDefault(raw, internalsettings.DefaultPortalRegistrationEnabled), nil
+	}
+	if h == nil || h.db == nil {
+		return internalsettings.DefaultPortalRegistrationEnabled, nil
+	}
+
+	var setting models.Setting
+	errFind := h.db.WithContext(ctx).
+		Select("value").
+		Where("key = ?", internalsettings.PortalRegistrationEnabledKey).
+		First(&setting).Error
+	if errFind == nil {
+		return parseDBConfigBoolWithDefault(setting.Value, internalsettings.DefaultPortalRegistrationEnabled), nil
+	}
+	if errors.Is(errFind, gorm.ErrRecordNotFound) {
+		return internalsettings.DefaultPortalRegistrationEnabled, nil
+	}
+	return false, errFind
 }
 
 // loginRequest defines the request body for login.

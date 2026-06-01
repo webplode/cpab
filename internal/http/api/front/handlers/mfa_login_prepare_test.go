@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/config"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/security"
+	internalsettings "github.com/router-for-me/CLIProxyAPIBusiness/internal/settings"
 	"gorm.io/gorm"
 )
 
@@ -84,6 +85,28 @@ func newFrontMFATestHandler(t *testing.T) (*AuthHandler, *gorm.DB) {
 	}, db
 }
 
+func withPortalRegistrationSetting(t *testing.T, value json.RawMessage) {
+	t.Helper()
+
+	previousUpdatedAt := internalsettings.DBConfigUpdatedAt()
+	previousValue, hadPrevious := internalsettings.DBConfigValue(internalsettings.PortalRegistrationEnabledKey)
+	t.Cleanup(func() {
+		values := map[string]json.RawMessage{}
+		if hadPrevious {
+			values[internalsettings.PortalRegistrationEnabledKey] = previousValue
+		}
+		internalsettings.StoreDBConfig(previousUpdatedAt, values)
+	})
+
+	values := map[string]json.RawMessage{}
+	if value != nil {
+		copied := make([]byte, len(value))
+		copy(copied, value)
+		values[internalsettings.PortalRegistrationEnabledKey] = copied
+	}
+	internalsettings.StoreDBConfig(time.Now().UTC(), values)
+}
+
 func runFrontAuthRequest(t *testing.T, target string, body string, invoke func(*gin.Context)) (int, frontAuthResponse) {
 	t.Helper()
 
@@ -101,6 +124,29 @@ func runFrontAuthRequest(t *testing.T, target string, body string, invoke func(*
 		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 			t.Fatalf("decode response: %v", errDecode)
 		}
+	}
+	return recorder.Code, response
+}
+
+func runFrontPublicConfig(t *testing.T) (int, struct {
+	SiteName                  string `json:"site_name"`
+	PortalRegistrationEnabled bool   `json:"portal_registration_enabled"`
+}) {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/front/config", nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	GetPublicConfig(ctx)
+
+	var response struct {
+		SiteName                  string `json:"site_name"`
+		PortalRegistrationEnabled bool   `json:"portal_registration_enabled"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
 	}
 	return recorder.Code, response
 }
@@ -170,6 +216,86 @@ func TestFrontLoginPrepareMasksMissingAndDisabledUsers(t *testing.T) {
 				t.Fatalf("response = %+v, want zero MFA flags", response)
 			}
 		})
+	}
+}
+
+func TestFrontPublicConfigDefaultsPortalRegistrationEnabled(t *testing.T) {
+	withPortalRegistrationSetting(t, nil)
+
+	status, response := runFrontPublicConfig(t)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if !response.PortalRegistrationEnabled {
+		t.Fatalf("portal_registration_enabled = false, want true")
+	}
+}
+
+func TestFrontPublicConfigIncludesPortalRegistrationFlag(t *testing.T) {
+	withPortalRegistrationSetting(t, json.RawMessage("false"))
+
+	status, response := runFrontPublicConfig(t)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if response.PortalRegistrationEnabled {
+		t.Fatalf("portal_registration_enabled = true, want false")
+	}
+}
+
+func TestFrontRegisterRejectsWhenPortalRegistrationDisabled(t *testing.T) {
+	withPortalRegistrationSetting(t, json.RawMessage("false"))
+
+	db := openFrontLoginPrepareTestDB(t)
+	handler := &AuthHandler{db: db}
+	status, response := runFrontAuthRequest(
+		t,
+		"/v0/front/register",
+		`{"username":"alice","email":"alice@example.com","password":"password123"}`,
+		handler.Register,
+	)
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", status, http.StatusForbidden)
+	}
+	if response.Error != "registration is disabled" {
+		t.Fatalf("error = %q, want %q", response.Error, "registration is disabled")
+	}
+
+	var count int64
+	if errCount := db.Model(&models.User{}).Count(&count).Error; errCount != nil {
+		t.Fatalf("count users: %v", errCount)
+	}
+	if count != 0 {
+		t.Fatalf("user count = %d, want 0", count)
+	}
+}
+
+func TestFrontRegisterRejectsWhenDBPortalRegistrationDisabledBeforeSnapshot(t *testing.T) {
+	withPortalRegistrationSetting(t, nil)
+
+	db := openFrontLoginPrepareTestDB(t)
+	if errMigrate := db.AutoMigrate(&models.Setting{}); errMigrate != nil {
+		t.Fatalf("migrate settings: %v", errMigrate)
+	}
+	if errCreate := db.Create(&models.Setting{
+		Key:   internalsettings.PortalRegistrationEnabledKey,
+		Value: json.RawMessage("false"),
+	}).Error; errCreate != nil {
+		t.Fatalf("create setting: %v", errCreate)
+	}
+
+	handler := &AuthHandler{db: db}
+	status, response := runFrontAuthRequest(
+		t,
+		"/v0/front/register",
+		`{"username":"alice","email":"alice@example.com","password":"password123"}`,
+		handler.Register,
+	)
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", status, http.StatusForbidden)
+	}
+	if response.Error != "registration is disabled" {
+		t.Fatalf("error = %q, want %q", response.Error, "registration is disabled")
 	}
 }
 

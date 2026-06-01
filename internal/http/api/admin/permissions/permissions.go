@@ -129,6 +129,7 @@ var definitions = []Definition{
 	newDefinition("GET", "/v0/admin/dashboard/transactions", "View Recent Transactions", "Dashboard"),
 
 	newDefinition("POST", "/v0/admin/users", "Create User", "Users"),
+	newDefinition("POST", "/v0/admin/users/batch-delete", "Batch Delete Users", "Users"),
 	newDefinition("GET", "/v0/admin/users", "List Users", "Users"),
 	newDefinition("GET", "/v0/admin/users/:id", "Get User", "Users"),
 	newDefinition("PUT", "/v0/admin/users/:id", "Update User", "Users"),
@@ -162,6 +163,8 @@ var definitions = []Definition{
 	newDefinition("DELETE", "/v0/admin/auth-files/:id", "Delete Auth File", "Auth Files"),
 	newDefinition("POST", "/v0/admin/auth-files/:id/available", "Set Auth File Available", "Auth Files"),
 	newDefinition("POST", "/v0/admin/auth-files/:id/unavailable", "Set Auth File Unavailable", "Auth Files"),
+	newDefinition("POST", "/v0/admin/auth-files/:id/liveness-check", "Check Auth File Liveness", "Auth Files"),
+	newDefinition("POST", "/v0/admin/auth-files/:id/refresh", "Refresh Auth File Token", "Auth Files"),
 	newDefinition("GET", "/v0/admin/auth-files/types", "List Auth File Types", "Auth Files"),
 
 	newDefinition("GET", "/v0/admin/quotas", "List Quotas", "Quota"),

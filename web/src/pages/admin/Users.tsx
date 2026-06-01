@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { AdminDashboardLayout } from '../../components/admin/AdminDashboardLayout';
 import { AdminNoAccessCard } from '../../components/admin/AdminNoAccessCard';
+import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { apiFetchAdmin } from '../../api/config';
 import { MultiGroupDropdownMenu } from '../../components/admin/MultiGroupDropdownMenu';
 import { Icon } from '../../components/Icon';
@@ -25,6 +26,19 @@ interface User {
 
 interface UsersResponse {
     users: User[];
+}
+
+interface BatchDeleteResponse {
+    deleted: number;
+    missing_ids?: number[];
+}
+
+interface ConfirmDialogState {
+    title: string;
+    message: string;
+    confirmText?: string;
+    danger?: boolean;
+    onConfirm: () => void;
 }
 
 interface CreateFormData {
@@ -975,6 +989,7 @@ export function AdminUsers() {
     const { hasPermission } = useAdminPermissions();
     const canListUsers = hasPermission(buildAdminPermissionKey('GET', '/v0/admin/users'));
     const canCreateUsers = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/users'));
+    const canBatchDeleteUsers = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/users/batch-delete'));
     const canUpdateUsers = hasPermission(buildAdminPermissionKey('PUT', '/v0/admin/users/:id'));
     const canDeleteUsers = hasPermission(buildAdminPermissionKey('DELETE', '/v0/admin/users/:id'));
     const canDisableUsers = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/users/:id/disable'));
@@ -987,6 +1002,7 @@ export function AdminUsers() {
     const canCreateUserApiKeys = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/users/:id/api-keys'));
 
     const [users, setUsers] = useState<User[]>([]);
+    const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
     const [loading, setLoading] = useState(true);
     const [searchQuery, setSearchQuery] = useState('');
     const [searchInput, setSearchInput] = useState('');
@@ -999,7 +1015,12 @@ export function AdminUsers() {
     const [groupFilterSearch, setGroupFilterSearch] = useState('');
     const [groupFilterBtnWidth, setGroupFilterBtnWidth] = useState<number | undefined>(undefined);
     const [apiKeyModalUser, setApiKeyModalUser] = useState<User | null>(null);
+    const [batchDeleteSubmitting, setBatchDeleteSubmitting] = useState(false);
+    const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+    const [toast, setToast] = useState<{ show: boolean; message: string }>({ show: false, message: '' });
     const locale = i18n.language === 'zh-CN' ? 'zh-CN' : 'en-US';
+    const selectPageCheckboxRef = useRef<HTMLInputElement>(null);
+    const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const fetchUsers = useCallback(
         async (search: string) => {
@@ -1068,13 +1089,55 @@ export function AdminUsers() {
         const start = (currentPage - 1) * PAGE_SIZE;
         return filteredUsers.slice(start, start + PAGE_SIZE);
     }, [filteredUsers, currentPage]);
+    const selectedUserSet = useMemo(() => new Set(selectedUserIds), [selectedUserIds]);
+    const selectedUsers = useMemo(
+        () => filteredUsers.filter((user) => selectedUserSet.has(user.id)),
+        [filteredUsers, selectedUserSet]
+    );
+    const visibleUserIds = useMemo(
+        () => paginatedUsers.map((user) => user.id),
+        [paginatedUsers]
+    );
+    const selectedVisibleCount = visibleUserIds.filter((id) => selectedUserSet.has(id)).length;
+    const allVisibleSelected = visibleUserIds.length > 0 && selectedVisibleCount === visibleUserIds.length;
+    const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
+    const tableColSpan = canBatchDeleteUsers ? 11 : 10;
 
     const { tableScrollRef, handleTableScroll, showActionsDivider } = useStickyActionsDivider(
         paginatedUsers.length,
         loading
     );
 
+    useEffect(() => {
+        const availableIds = new Set(filteredUsers.map((user) => user.id));
+        setSelectedUserIds((prev) => prev.filter((id) => availableIds.has(id)));
+    }, [filteredUsers]);
+
+    useEffect(() => {
+        if (selectPageCheckboxRef.current) {
+            selectPageCheckboxRef.current.indeterminate = someVisibleSelected;
+        }
+    }, [someVisibleSelected]);
+
     const formatDate = (dateString: string) => new Date(dateString).toLocaleString(locale);
+
+    const showToast = useCallback((message: string) => {
+        if (toastTimeoutRef.current) {
+            clearTimeout(toastTimeoutRef.current);
+        }
+        setToast({ show: true, message });
+        toastTimeoutRef.current = setTimeout(() => {
+            setToast({ show: false, message: '' });
+        }, 10000);
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (toastTimeoutRef.current) {
+                clearTimeout(toastTimeoutRef.current);
+            }
+        };
+    }, []);
 
     const handleEdit = (user: User) => {
         if (!canUpdateUsers) {
@@ -1093,6 +1156,79 @@ export function AdminUsers() {
         setUsers((prev) =>
             prev.map((item) => (item.id === updatedUser.id ? updatedUser : item))
         );
+    };
+
+    const handleToggleUserSelection = (userId: number, checked: boolean) => {
+        setSelectedUserIds((prev) => {
+            if (checked) {
+                if (prev.includes(userId)) {
+                    return prev;
+                }
+                return [...prev, userId];
+            }
+            return prev.filter((id) => id !== userId);
+        });
+    };
+
+    const handleToggleVisibleSelection = (checked: boolean) => {
+        setSelectedUserIds((prev) => {
+            if (checked) {
+                const next = new Set(prev);
+                for (const id of visibleUserIds) {
+                    next.add(id);
+                }
+                return Array.from(next);
+            }
+            const visibleIds = new Set(visibleUserIds);
+            return prev.filter((id) => !visibleIds.has(id));
+        });
+    };
+
+    const handleClearSelection = () => {
+        setSelectedUserIds([]);
+    };
+
+    const handleBatchDelete = () => {
+        if (!canBatchDeleteUsers || selectedUsers.length === 0 || batchDeleteSubmitting) {
+            return;
+        }
+        const ids = selectedUsers.map((user) => user.id);
+        setConfirmDialog({
+            title: t('Delete Selected Users'),
+            message: t('Are you sure you want to delete {{count}} selected users? This action cannot be undone.', {
+                count: ids.length,
+            }),
+            confirmText: t('Delete'),
+            danger: true,
+            onConfirm: async () => {
+                setBatchDeleteSubmitting(true);
+                try {
+                    const result = await apiFetchAdmin<BatchDeleteResponse>('/v0/admin/users/batch-delete', {
+                        method: 'POST',
+                        body: JSON.stringify({ ids }),
+                    });
+                    setSelectedUserIds((prev) => prev.filter((id) => !ids.includes(id)));
+                    await fetchUsers(searchQuery);
+                    const missingCount = result.missing_ids?.length || 0;
+                    if (missingCount > 0) {
+                        showToast(
+                            t('Deleted {{deleted}} users. {{missing}} selected users were already missing.', {
+                                deleted: result.deleted,
+                                missing: missingCount,
+                            })
+                        );
+                    } else {
+                        showToast(t('Deleted {{count}} users', { count: result.deleted }));
+                    }
+                } catch (err) {
+                    console.error('Failed to delete selected users:', err);
+                    showToast(err instanceof Error ? err.message : t('Failed to delete selected users.'));
+                } finally {
+                    setBatchDeleteSubmitting(false);
+                    setConfirmDialog(null);
+                }
+            },
+        });
     };
 
     const handleToggleDisable = async (user: User) => {
@@ -1166,15 +1302,38 @@ export function AdminUsers() {
     return (
         <AdminDashboardLayout title={t('Users')} subtitle={t('Manage system users')}>
             <div className="space-y-6">
-                {canCreateUsers && (
-                    <div className="flex justify-end">
-                        <button
-                            onClick={() => setCreatingUser(true)}
-                            className="inline-flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
-                        >
-                            <Icon name="add" size={18} />
-                            {t('New User')}
-                        </button>
+                {(canBatchDeleteUsers || canCreateUsers) && (
+                    <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div className="flex flex-wrap items-center gap-2">
+                            {canBatchDeleteUsers && (
+                                <button
+                                    onClick={handleBatchDelete}
+                                    disabled={selectedUsers.length === 0 || batchDeleteSubmitting}
+                                    className="flex items-center gap-2 px-4 py-2 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors font-medium border border-red-200 dark:border-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <Icon name="delete" size={18} />
+                                    {batchDeleteSubmitting ? t('Deleting...') : t('Delete Selected')}
+                                </button>
+                            )}
+                            {selectedUsers.length > 0 && (
+                                <button
+                                    onClick={handleClearSelection}
+                                    className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-background-dark text-slate-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors font-medium border border-gray-200 dark:border-border-dark"
+                                >
+                                    <Icon name="close" size={18} />
+                                    {t('Clear Selection')}
+                                </button>
+                            )}
+                        </div>
+                        {canCreateUsers && (
+                            <button
+                                onClick={() => setCreatingUser(true)}
+                                className="inline-flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
+                            >
+                                <Icon name="add" size={18} />
+                                {t('New User')}
+                            </button>
+                        )}
                     </div>
                 )}
                 <div className="flex flex-col md:flex-row gap-4 justify-between items-center bg-white dark:bg-surface-dark p-3 rounded-xl border border-gray-200 dark:border-border-dark shadow-sm">
@@ -1250,6 +1409,19 @@ export function AdminUsers() {
                         <table className="w-full text-left text-sm">
                             <thead className="bg-gray-50 dark:bg-surface-dark text-gray-500 dark:text-gray-400 uppercase text-xs font-semibold border-b border-gray-200 dark:border-border-dark">
                                 <tr>
+                                    {canBatchDeleteUsers && (
+                                        <th className="px-6 py-4">
+                                            <input
+                                                ref={selectPageCheckboxRef}
+                                                type="checkbox"
+                                                checked={allVisibleSelected}
+                                                disabled={visibleUserIds.length === 0}
+                                                onChange={(e) => handleToggleVisibleSelection(e.target.checked)}
+                                                aria-label={t('Select visible users')}
+                                                className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-dark dark:bg-background-dark"
+                                            />
+                                        </th>
+                                    )}
                                     <th className="px-6 py-4">{t('ID')}</th>
                                     <th className="px-6 py-4">{t('Username')}</th>
                                     <th className="px-6 py-4">{t('Email')}</th>
@@ -1272,14 +1444,14 @@ export function AdminUsers() {
                             {loading ? (
                                 [...Array(5)].map((_, i) => (
                                     <tr key={i}>
-                                        <td colSpan={10} className="px-6 py-4">
+                                        <td colSpan={tableColSpan} className="px-6 py-4">
                                             <div className="animate-pulse h-4 bg-slate-200 dark:bg-border-dark rounded"></div>
                                         </td>
                                     </tr>
                                 ))
                             ) : paginatedUsers.length === 0 ? (
                                 <tr>
-                                    <td colSpan={10} className="px-6 py-8 text-center text-slate-500 dark:text-text-secondary">
+                                    <td colSpan={tableColSpan} className="px-6 py-8 text-center text-slate-500 dark:text-text-secondary">
                                         {searchQuery ? t('No users found') : t('No users yet')}
                                     </td>
                                 </tr>
@@ -1289,6 +1461,17 @@ export function AdminUsers() {
                                         key={user.id}
                                         className="hover:bg-gray-50 dark:hover:bg-background-dark group"
                                     >
+                                        {canBatchDeleteUsers && (
+                                            <td className="px-6 py-4">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedUserSet.has(user.id)}
+                                                    onChange={(e) => handleToggleUserSelection(user.id, e.target.checked)}
+                                                    aria-label={t('Select user {{id}}', { id: user.id })}
+                                                    className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary dark:border-border-dark dark:bg-background-dark"
+                                                />
+                                            </td>
+                                        )}
                                         <td className="px-6 py-4 whitespace-nowrap text-slate-600 dark:text-text-secondary font-mono">
                                             {user.id}
                                         </td>
@@ -1487,6 +1670,34 @@ export function AdminUsers() {
                     canCreate={canCreateUserApiKeys}
                     onClose={() => setApiKeyModalUser(null)}
                 />
+            )}
+
+            {confirmDialog && (
+                <ConfirmDialog
+                    title={confirmDialog.title}
+                    message={confirmDialog.message}
+                    confirmText={confirmDialog.confirmText}
+                    danger={confirmDialog.danger}
+                    onConfirm={confirmDialog.onConfirm}
+                    onCancel={() => setConfirmDialog(null)}
+                />
+            )}
+
+            {toast.show && (
+                <div className="fixed top-4 right-4 z-[9999] animate-slide-in-right">
+                    <div className="flex items-center gap-3 px-4 py-3 bg-emerald-50 dark:bg-emerald-900 border border-emerald-200 dark:border-emerald-800 rounded-lg shadow-lg">
+                        <Icon name="check_circle" size={20} className="text-emerald-500" />
+                        <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
+                            {toast.message}
+                        </span>
+                        <button
+                            onClick={() => setToast({ show: false, message: '' })}
+                            className="inline-flex h-7 w-7 items-center justify-center text-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-300 rounded transition-colors"
+                        >
+                            <Icon name="close" size={16} />
+                        </button>
+                    </div>
+                </div>
             )}
         </AdminDashboardLayout>
     );

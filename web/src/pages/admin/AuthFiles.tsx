@@ -258,9 +258,26 @@ interface AuthFile {
     }[];
     content: Record<string, unknown>;
     is_available: boolean;
+    auth_health?: AuthHealth;
     rate_limit: number;
     created_at: string;
     updated_at: string;
+}
+
+interface AuthHealth {
+    state?: string;
+    message?: string;
+    provider?: string;
+    source?: string;
+    checked_at?: string;
+    expires_at?: string;
+    last_refresh?: string;
+    has_refresh_token?: boolean;
+    refresh_supported?: boolean;
+    liveness_supported?: boolean;
+    runtime_loaded?: boolean;
+    needs_relogin?: boolean;
+    http_status?: number;
 }
 
 interface ListResponse {
@@ -322,6 +339,11 @@ interface ForceQuotaCheckResponse {
     checked: number;
     skipped: number;
     missing: number;
+}
+
+interface AuthHealthResponse {
+    auth_health: AuthHealth;
+    refreshed?: boolean;
 }
 
 interface ConfirmDialogState {
@@ -509,6 +531,10 @@ export function AdminAuthFiles() {
     const canExportSelectedAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/export'));
     const canBatchDeleteAuthFiles = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/batch-delete'));
     const canForceQuotaCheck = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/quotas/check'));
+    const canCheckLiveness = hasPermission(
+        buildAdminPermissionKey('POST', '/v0/admin/auth-files/:id/liveness-check')
+    );
+    const canRefreshAuthToken = hasPermission(buildAdminPermissionKey('POST', '/v0/admin/auth-files/:id/refresh'));
 
     const [authFiles, setAuthFiles] = useState<AuthFile[]>([]);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -574,6 +600,8 @@ export function AdminAuthFiles() {
     const [batchGroupSearch, setBatchGroupSearch] = useState('');
     const [batchDeleteSubmitting, setBatchDeleteSubmitting] = useState(false);
     const [forceQuotaSubmitting, setForceQuotaSubmitting] = useState(false);
+    const [healthCheckingIds, setHealthCheckingIds] = useState<Set<number>>(new Set());
+    const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set());
     const [selectedProxyIds, setSelectedProxyIds] = useState<Set<number>>(new Set());
     const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -847,6 +875,116 @@ export function AdminAuthFiles() {
     const getContentType = (file: AuthFile): string => {
         return (file.content?.type as string) || '';
     };
+
+    const updateAuthHealth = useCallback((id: number, authHealth: AuthHealth) => {
+        setAuthFiles((prev) =>
+            prev.map((file) => (file.id === id ? { ...file, auth_health: authHealth } : file))
+        );
+    }, []);
+
+    const formatAuthHealthLabel = useCallback(
+        (health?: AuthHealth) => {
+            switch (health?.state) {
+                case 'healthy':
+                    return t('Healthy');
+                case 'expired':
+                    return t('Expired');
+                case 'invalid_content':
+                    return t('Invalid content');
+                case 'missing_credentials':
+                    return t('Missing credentials');
+                case 'needs_relogin':
+                    return t('Needs relogin');
+                case 'poll_failed':
+                    return t('Poll failed');
+                case 'refresh_failed':
+                    return t('Refresh failed');
+                case 'unsupported':
+                    return t('Unsupported');
+                case 'unknown':
+                case undefined:
+                case '':
+                    return t('Unknown');
+                default:
+                    return health?.state || t('Unknown');
+            }
+        },
+        [t]
+    );
+
+    const authHealthClassName = (health?: AuthHealth) => {
+        switch (health?.state) {
+            case 'healthy':
+                return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-100 dark:border-emerald-800';
+            case 'expired':
+            case 'needs_relogin':
+                return 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 border-amber-100 dark:border-amber-800';
+            case 'invalid_content':
+            case 'missing_credentials':
+            case 'poll_failed':
+            case 'refresh_failed':
+                return 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-100 dark:border-red-800';
+            case 'unsupported':
+            case 'unknown':
+            default:
+                return 'bg-gray-50 text-gray-700 dark:bg-gray-900/30 dark:text-gray-400 border-gray-100 dark:border-gray-800';
+        }
+    };
+
+    const formatAuthHealthTitle = useCallback(
+        (health?: AuthHealth) => {
+            const details = [formatAuthHealthLabel(health)];
+            if (health?.provider) {
+                details.push(`${t('Provider')}: ${health.provider}`);
+            }
+            if (health?.source) {
+                details.push(`${t('Source')}: ${health.source}`);
+            }
+            if (health?.checked_at) {
+                details.push(t('Checked {{time}}', { time: formatDate(health.checked_at, locale) }));
+            }
+            if (health?.expires_at) {
+                details.push(t('Expires {{time}}', { time: formatDate(health.expires_at, locale) }));
+            }
+            return details.join('\n');
+        },
+        [formatAuthHealthLabel, locale, t]
+    );
+
+    const postAuthHealthAction = useCallback(
+        async (endpoint: string): Promise<{ ok: boolean; data?: AuthHealthResponse; error?: string }> => {
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            const token = localStorage.getItem(TOKEN_KEY_ADMIN);
+            if (token) {
+                headers.Authorization = `Bearer ${token}`;
+            }
+
+            const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+                method: 'POST',
+                headers,
+            });
+            if (response.status === 401) {
+                localStorage.removeItem(TOKEN_KEY_ADMIN);
+                localStorage.removeItem(USER_KEY_ADMIN);
+                window.location.href = '/admin/login';
+                throw new Error('Unauthorized');
+            }
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                return {
+                    ok: false,
+                    data: data as AuthHealthResponse,
+                    error:
+                        typeof (data as { error?: unknown }).error === 'string'
+                            ? (data as { error: string }).error
+                            : `Request failed with status ${response.status}`,
+                };
+            }
+            return { ok: true, data: data as AuthHealthResponse };
+        },
+        []
+    );
 
     const resolveDefaultAuthGroupIds = useCallback(() => {
         if (authGroups.length === 0) {
@@ -1264,6 +1402,74 @@ export function AdminAuthFiles() {
         } finally {
             setForceQuotaSubmitting(false);
         }
+    };
+
+    const handleLivenessCheck = async (file: AuthFile) => {
+        if (!canCheckLiveness || healthCheckingIds.has(file.id) || file.auth_health?.liveness_supported === false) {
+            return;
+        }
+
+        setHealthCheckingIds((prev) => {
+            const next = new Set(prev);
+            next.add(file.id);
+            return next;
+        });
+        try {
+            const result = await postAuthHealthAction(`/v0/admin/auth-files/${file.id}/liveness-check`);
+            if (result.data?.auth_health) {
+                updateAuthHealth(file.id, result.data.auth_health);
+            }
+            showToast(result.ok ? t('Liveness check completed') : result.error || t('Liveness check failed.'));
+        } catch (err) {
+            console.error('Failed to check auth liveness:', err);
+            showToast(err instanceof Error ? err.message : t('Liveness check failed.'));
+        } finally {
+            setHealthCheckingIds((prev) => {
+                const next = new Set(prev);
+                next.delete(file.id);
+                return next;
+            });
+        }
+    };
+
+    const performRefreshAuthToken = async (file: AuthFile) => {
+        setRefreshingIds((prev) => {
+            const next = new Set(prev);
+            next.add(file.id);
+            return next;
+        });
+        try {
+            const result = await postAuthHealthAction(`/v0/admin/auth-files/${file.id}/refresh`);
+            if (result.data?.auth_health) {
+                updateAuthHealth(file.id, result.data.auth_health);
+            }
+            showToast(result.ok ? t('Auth token refreshed successfully') : result.error || t('Auth token refresh failed.'));
+        } catch (err) {
+            console.error('Failed to refresh auth token:', err);
+            showToast(err instanceof Error ? err.message : t('Auth token refresh failed.'));
+        } finally {
+            setRefreshingIds((prev) => {
+                const next = new Set(prev);
+                next.delete(file.id);
+                return next;
+            });
+        }
+    };
+
+    const handleRefreshAuthToken = (file: AuthFile) => {
+        if (!canRefreshAuthToken || refreshingIds.has(file.id) || !file.auth_health?.refresh_supported) {
+            return;
+        }
+
+        setConfirmDialog({
+            title: t('Refresh Auth Token'),
+            message: t('Refresh auth token for {{key}}?', { key: file.key }),
+            confirmText: t('Refresh'),
+            onConfirm: () => {
+                setConfirmDialog(null);
+                void performRefreshAuthToken(file);
+            },
+        });
     };
 
     const handleDelete = async (id: number) => {
@@ -2200,6 +2406,7 @@ export function AdminAuthFiles() {
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Priority')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Rate limit')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Status')}</th>
+                                    <th className="px-6 py-4 font-semibold tracking-wider">{t('Health')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Created At')}</th>
                                     <th className="px-6 py-4 font-semibold tracking-wider">{t('Updated At')}</th>
                                     <th
@@ -2214,13 +2421,13 @@ export function AdminAuthFiles() {
                             <tbody className="divide-y divide-gray-200 dark:divide-border-dark">
                                 {loading ? (
                                     <tr>
-                                        <td colSpan={10} className="px-6 py-12 text-center">
+                                        <td colSpan={11} className="px-6 py-12 text-center">
                                             {t('Loading...')}
                                         </td>
                                     </tr>
                                 ) : authFiles.length === 0 ? (
                                     <tr>
-                                        <td colSpan={10} className="px-6 py-12 text-center">
+                                        <td colSpan={11} className="px-6 py-12 text-center">
                                             {t('No auth files found')}
                                         </td>
                                     </tr>
@@ -2290,6 +2497,30 @@ export function AdminAuthFiles() {
                                                     </span>
                                                 )}
                                             </td>
+                                            <td className="px-6 py-4">
+                                                <div className="flex flex-col gap-1">
+                                                    <span
+                                                        className={`inline-flex w-fit items-center px-2.5 py-1 rounded-full text-xs font-medium border ${authHealthClassName(file.auth_health)}`}
+                                                        title={formatAuthHealthTitle(file.auth_health)}
+                                                    >
+                                                        {formatAuthHealthLabel(file.auth_health)}
+                                                    </span>
+                                                    {file.auth_health?.checked_at && (
+                                                        <span className="text-xs text-slate-500 dark:text-text-secondary">
+                                                            {t('Checked {{time}}', {
+                                                                time: formatDate(file.auth_health.checked_at, locale),
+                                                            })}
+                                                        </span>
+                                                    )}
+                                                    {file.auth_health?.expires_at && (
+                                                        <span className="text-xs text-slate-500 dark:text-text-secondary">
+                                                            {t('Expires {{time}}', {
+                                                                time: formatDate(file.auth_health.expires_at, locale),
+                                                            })}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </td>
                                             <td className="px-6 py-4 font-mono text-xs">
                                                 {formatDate(file.created_at, locale)}
                                             </td>
@@ -2327,6 +2558,54 @@ export function AdminAuthFiles() {
                                                         >
                                                             <Icon
                                                                 name={file.is_available ? 'toggle_off' : 'toggle_on'}
+                                                                size={18}
+                                                            />
+                                                        </button>
+                                                    )}
+                                                    {canCheckLiveness && (
+                                                        <button
+                                                            onClick={() => handleLivenessCheck(file)}
+                                                            disabled={
+                                                                healthCheckingIds.has(file.id) ||
+                                                                file.auth_health?.liveness_supported === false
+                                                            }
+                                                            className="p-2 text-gray-400 hover:text-blue-500 hover:bg-gray-100 dark:hover:bg-background-dark rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                                                            title={
+                                                                file.auth_health?.liveness_supported === false
+                                                                    ? t('Liveness check unavailable')
+                                                                    : healthCheckingIds.has(file.id)
+                                                                      ? t('Checking...')
+                                                                      : t('Check liveness')
+                                                            }
+                                                        >
+                                                            <Icon
+                                                                name={
+                                                                    healthCheckingIds.has(file.id)
+                                                                        ? 'hourglass_empty'
+                                                                        : 'monitor_heart'
+                                                                }
+                                                                size={18}
+                                                            />
+                                                        </button>
+                                                    )}
+                                                    {canRefreshAuthToken && (
+                                                        <button
+                                                            onClick={() => handleRefreshAuthToken(file)}
+                                                            disabled={
+                                                                refreshingIds.has(file.id) ||
+                                                                !file.auth_health?.refresh_supported
+                                                            }
+                                                            className="p-2 text-gray-400 hover:text-primary hover:bg-gray-100 dark:hover:bg-background-dark rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                                                            title={
+                                                                !file.auth_health?.refresh_supported
+                                                                    ? t('Refresh token unavailable')
+                                                                    : refreshingIds.has(file.id)
+                                                                      ? t('Refreshing...')
+                                                                      : t('Refresh Auth Token')
+                                                            }
+                                                        >
+                                                            <Icon
+                                                                name={refreshingIds.has(file.id) ? 'hourglass_empty' : 'sync'}
                                                                 size={18}
                                                             />
                                                         </button>

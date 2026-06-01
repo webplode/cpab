@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	relayhttp "github.com/router-for-me/CLIProxyAPIBusiness/internal/http"
 	internalhttp "github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/admin"
+	adminhandlers "github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/admin/handlers"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/http/api/front"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelreference"
@@ -138,6 +139,7 @@ func RunServer(ctx context.Context, cfg config.AppConfig, defaultPort int) error
 		WithRequestAccessManager(serverAccessMgr).
 		WithCoreAuthManager(coreManager).
 		WithServerOptions(
+			sdkapi.WithHealthzHandler(adminhandlers.NewHealthHandler(conn).Healthz),
 			sdkapi.WithMiddleware(
 				logging.GinLogrusRecovery(),
 				logging.GinLogrusLogger(),

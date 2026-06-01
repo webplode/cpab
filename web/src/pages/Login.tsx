@@ -5,6 +5,7 @@ import { LanguageSwitcher } from '../components/LanguageSwitcher';
 import { API_BASE_URL, TOKEN_KEY_FRONT, USER_KEY_FRONT } from '../api/config';
 import { credentialToJSON, parseRequestOptions } from '../utils/webauthn';
 import { useTranslation } from 'react-i18next';
+import { usePublicConfig } from '../utils/siteName';
 
 function Logo() {
     return (
@@ -51,6 +52,7 @@ export function Login() {
     const { t } = useTranslation();
     const navigate = useNavigate();
     const location = useLocation();
+    const { portalRegistrationEnabled, loading: publicConfigLoading } = usePublicConfig();
     const [showPassword, setShowPassword] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -66,6 +68,7 @@ export function Login() {
         username: '',
         password: '',
     });
+    const showRegistrationLink = !publicConfigLoading && portalRegistrationEnabled;
 
     useEffect(() => {
         if (location.state?.registered) {
@@ -434,17 +437,19 @@ export function Login() {
                         </form>
 
                         {/* Footer Links */}
-                        <div className="mt-8 flex items-center justify-between text-sm text-[#92a4c9]">
-                            <div className="flex gap-1">
-                                <span>{t("Don't have an account?")}</span>
-                                <Link
-                                    to="/register"
-                                    className="text-white font-medium hover:text-primary transition-colors"
-                                >
-                                    {t('Sign Up')}
-                                </Link>
+                        {showRegistrationLink ? (
+                            <div className="mt-8 flex items-center justify-between text-sm text-[#92a4c9]">
+                                <div className="flex gap-1">
+                                    <span>{t("Don't have an account?")}</span>
+                                    <Link
+                                        to="/register"
+                                        className="text-white font-medium hover:text-primary transition-colors"
+                                    >
+                                        {t('Sign Up')}
+                                    </Link>
+                                </div>
                             </div>
-                        </div>
+                        ) : null}
                         <div className="mt-auto pt-8 flex items-center gap-4 text-xs text-[#64748b]">
                             <LanguageSwitcher variant="dark" size="sm" menuDirection="up" menuAlign="left" />
                             <a

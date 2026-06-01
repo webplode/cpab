@@ -3,8 +3,15 @@ import { apiFetchFront } from '../api/config';
 
 const DEFAULT_SITE_NAME = 'CLIProxyAPI';
 
-interface SiteConfigResponse {
+interface PublicConfigResponse {
     site_name?: unknown;
+    portal_registration_enabled?: unknown;
+}
+
+interface PublicConfig {
+    siteName: string;
+    portalRegistrationEnabled: boolean;
+    loading: boolean;
 }
 
 function normalizeSiteName(value: unknown, fallback: string): string {
@@ -15,24 +22,59 @@ function normalizeSiteName(value: unknown, fallback: string): string {
     return trimmed ? trimmed : fallback;
 }
 
-export function useSiteName(fallback = DEFAULT_SITE_NAME): string {
-    const [siteName, setSiteName] = useState(fallback);
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+    if (typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (['true', '1', 'yes', 'on', 'enabled'].includes(normalized)) {
+            return true;
+        }
+        if (['false', '0', 'no', 'off', 'disabled'].includes(normalized)) {
+            return false;
+        }
+    }
+    return fallback;
+}
+
+export function usePublicConfig(fallback = DEFAULT_SITE_NAME): PublicConfig {
+    const [config, setConfig] = useState<PublicConfig>({
+        siteName: fallback,
+        portalRegistrationEnabled: true,
+        loading: true,
+    });
 
     useEffect(() => {
         let mounted = true;
-        apiFetchFront<SiteConfigResponse>('/v0/front/config')
+        apiFetchFront<PublicConfigResponse>('/v0/front/config')
             .then((res) => {
                 if (!mounted) return;
-                setSiteName(normalizeSiteName(res.site_name, fallback));
+                setConfig({
+                    siteName: normalizeSiteName(res.site_name, fallback),
+                    portalRegistrationEnabled: normalizeBoolean(
+                        res.portal_registration_enabled,
+                        true
+                    ),
+                    loading: false,
+                });
             })
             .catch(() => {
                 if (!mounted) return;
-                setSiteName(fallback);
+                setConfig({
+                    siteName: fallback,
+                    portalRegistrationEnabled: true,
+                    loading: false,
+                });
             });
         return () => {
             mounted = false;
         };
     }, [fallback]);
 
-    return siteName;
+    return config;
+}
+
+export function useSiteName(fallback = DEFAULT_SITE_NAME): string {
+    return usePublicConfig(fallback).siteName;
 }

@@ -25,9 +25,6 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 		return
 	}
 
-	healthHandler := handlers.NewHealthHandler(db)
-	r.GET("/healthz", healthHandler.Healthz)
-
 	versionHandler := handlers.NewVersionHandler(db, jwtCfg)
 	r.GET("/v0/version", versionHandler.GetVersion)
 
@@ -93,6 +90,7 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 
 	userHandler := handlers.NewUserHandler(db)
 	authed.POST("/users", userHandler.Create)
+	authed.POST("/users/batch-delete", userHandler.BatchDelete)
 	authed.GET("/users", userHandler.List)
 	authed.GET("/users/:id", userHandler.Get)
 	authed.PUT("/users/:id", userHandler.Update)
@@ -109,19 +107,21 @@ func RegisterAdminRoutes(r *gin.Engine, db *gorm.DB, jwtCfg config.JWTConfig, co
 	authed.DELETE("/auth-groups/:id", authGroupHandler.Delete)
 	authed.POST("/auth-groups/:id/default", authGroupHandler.SetDefault)
 
-	authFileHandler := handlers.NewAuthFileHandler(db)
+	authFileHandler := handlers.NewAuthFileHandler(db, coreManager)
 	authed.POST("/auth-files", authFileHandler.Create)
 	authed.POST("/auth-files/import", authFileHandler.Import)
 	authed.GET("/auth-files/export", authFileHandler.Export)
 	authed.POST("/auth-files/export", authFileHandler.ExportSelected)
 	authed.POST("/auth-files/batch-delete", authFileHandler.BatchDelete)
 	authed.GET("/auth-files", authFileHandler.List)
+	authed.GET("/auth-files/types", authFileHandler.ListTypes)
 	authed.GET("/auth-files/:id", authFileHandler.Get)
 	authed.PUT("/auth-files/:id", authFileHandler.Update)
 	authed.DELETE("/auth-files/:id", authFileHandler.Delete)
 	authed.POST("/auth-files/:id/available", authFileHandler.SetAvailable)
 	authed.POST("/auth-files/:id/unavailable", authFileHandler.SetUnavailable)
-	authed.GET("/auth-files/types", authFileHandler.ListTypes)
+	authed.POST("/auth-files/:id/liveness-check", authFileHandler.LivenessCheck)
+	authed.POST("/auth-files/:id/refresh", authFileHandler.Refresh)
 
 	quotaHandler := handlers.NewQuotaHandler(db, coreManager)
 	authed.GET("/quotas", quotaHandler.List)

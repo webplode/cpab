@@ -30,6 +30,11 @@ func WithRouterConfigurator(fn func(*gin.Engine, *handlers.BaseAPIHandler, *conf
 	return internalapi.WithRouterConfigurator(fn)
 }
 
+// WithHealthzHandler replaces the default /healthz route handler.
+func WithHealthzHandler(fn gin.HandlerFunc) ServerOption {
+	return internalapi.WithHealthzHandler(fn)
+}
+
 // WithLocalManagementPassword stores a runtime-only management password accepted for localhost requests.
 func WithLocalManagementPassword(password string) ServerOption {
 	return internalapi.WithLocalManagementPassword(password)

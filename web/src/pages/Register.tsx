@@ -4,6 +4,7 @@ import { Icon } from '../components/Icon';
 import { LanguageSwitcher } from '../components/LanguageSwitcher';
 import { API_BASE_URL } from '../api/config';
 import { useTranslation } from 'react-i18next';
+import { usePublicConfig } from '../utils/siteName';
 
 interface RegisterFormData {
     username: string;
@@ -19,6 +20,7 @@ interface ApiError {
 export function Register() {
     const { t } = useTranslation();
     const navigate = useNavigate();
+    const { portalRegistrationEnabled, loading: publicConfigLoading } = usePublicConfig();
     const [showPassword, setShowPassword] = useState(false);
     const [agreedToTerms, setAgreedToTerms] = useState(false);
     const [loading, setLoading] = useState(false);
@@ -30,6 +32,8 @@ export function Register() {
         confirmPassword: '',
     });
 
+    const registrationAvailable = !publicConfigLoading && portalRegistrationEnabled;
+
     const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const { name, value } = e.target;
         setFormData((prev) => ({ ...prev, [name]: value }));
@@ -37,6 +41,9 @@ export function Register() {
     };
 
     const validateForm = (): string | null => {
+        if (!portalRegistrationEnabled) {
+            return t('Registration is disabled');
+        }
         if (!formData.username.trim()) {
             return t('Username is required');
         }
@@ -112,25 +119,48 @@ export function Register() {
                         {/* Form Header */}
                         <div className="flex flex-col gap-2 text-center mb-8">
                             <div className="mx-auto bg-primary/10 h-12 w-12 rounded-full mb-2 inline-flex items-center justify-center">
-                                <Icon name="person_add" size={32} className="text-primary" />
+                                <Icon
+                                    name={registrationAvailable ? 'person_add' : 'lock'}
+                                    size={32}
+                                    className="text-primary"
+                                />
                             </div>
                             <h1 className="text-white text-2xl sm:text-[28px] font-bold leading-tight tracking-[-0.015em]">
-                                {t('Create your account')}
+                                {publicConfigLoading
+                                    ? t('Loading...')
+                                    : registrationAvailable
+                                        ? t('Create your account')
+                                        : t('Registration is disabled')}
                             </h1>
                             <p className="text-slate-400 text-base font-normal leading-normal">
-                                {t('Start relaying large model APIs with enterprise-grade reliability.')}
+                                {publicConfigLoading
+                                    ? t('Loading public portal settings...')
+                                    : registrationAvailable
+                                        ? t('Start relaying large model APIs with enterprise-grade reliability.')
+                                        : t(
+                                              'New portal accounts are temporarily disabled by an administrator.'
+                                          )}
                             </p>
                         </div>
 
-                        {/* Error Message */}
-                        {error && (
-                            <div className="mb-5 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
-                                {error}
+                        {publicConfigLoading ? (
+                            <div className="flex items-center justify-center py-12 text-slate-400">
+                                <span className="flex items-center gap-2 text-sm">
+                                    <Icon name="progress_activity" className="animate-spin" />
+                                    {t('Loading...')}
+                                </span>
                             </div>
-                        )}
+                        ) : registrationAvailable ? (
+                            <>
+                                {/* Error Message */}
+                                {error && (
+                                    <div className="mb-5 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+                                        {error}
+                                    </div>
+                                )}
 
-                        {/* Registration Form */}
-                        <form className="flex flex-col gap-5" onSubmit={handleSubmit}>
+                                {/* Registration Form */}
+                                <form className="flex flex-col gap-5" onSubmit={handleSubmit}>
                             {/* Username Field */}
                             <label className="flex flex-col w-full">
                                 <p className="text-white text-sm font-medium leading-normal pb-2">
@@ -258,22 +288,47 @@ export function Register() {
                                     <span className="truncate">{t('Create Account')}</span>
                                 )}
                             </button>
-                        </form>
+                                </form>
+                            </>
+                        ) : (
+                            <div className="flex flex-col items-center gap-6 py-4">
+                                <div className="flex h-14 w-14 items-center justify-center rounded-full bg-white/5 border border-border-dark text-primary">
+                                    <Icon name="lock" size={28} />
+                                </div>
+                                <p className="max-w-sm text-center text-slate-400 text-sm leading-relaxed">
+                                    {t(
+                                        'New portal accounts are temporarily disabled by an administrator.'
+                                    )}
+                                </p>
+                                <Link
+                                    to="/login"
+                                    className="inline-flex items-center justify-center rounded-lg h-12 px-5 bg-primary text-white text-sm font-bold hover:bg-blue-600 transition-colors"
+                                >
+                                    {t('Log in')}
+                                </Link>
+                            </div>
+                        )}
 
                         {/* Footer Link */}
                         <div className="mt-8 relative flex items-center justify-center px-12">
                             <div className="absolute left-0 top-1/2 -translate-y-1/2">
                                 <LanguageSwitcher variant="dark" size="sm" menuDirection="up" menuAlign="left" />
                             </div>
-                            <p className="text-slate-400 text-sm text-center">
-                                {t('Already have an account?')}{' '}
-                                <Link
-                                    to="/login"
-                                    className="text-primary font-bold hover:text-blue-400 hover:underline"
-                                >
-                                    {t('Log in')}
-                                </Link>
-                            </p>
+                            {registrationAvailable ? (
+                                <p className="text-slate-400 text-sm text-center">
+                                    {t('Already have an account?')}{' '}
+                                    <Link
+                                        to="/login"
+                                        className="text-primary font-bold hover:text-blue-400 hover:underline"
+                                    >
+                                        {t('Log in')}
+                                    </Link>
+                                </p>
+                            ) : (
+                                <p className="text-slate-500 text-sm text-center">
+                                    {t('Portal registration is controlled by your administrator.')}
+                                </p>
+                            )}
                         </div>
                     </div>
                 </div>

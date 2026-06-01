@@ -12,7 +12,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
+	quotapkg "github.com/router-for-me/CLIProxyAPIBusiness/internal/quota"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -25,7 +28,7 @@ func openAuthFilesTestDB(t *testing.T) *gorm.DB {
 	if errOpen != nil {
 		t.Fatalf("open db: %v", errOpen)
 	}
-	if errMigrate := db.AutoMigrate(&models.Auth{}, &models.AuthGroup{}); errMigrate != nil {
+	if errMigrate := db.AutoMigrate(&models.Auth{}, &models.AuthGroup{}, &models.Quota{}); errMigrate != nil {
 		t.Fatalf("migrate db: %v", errMigrate)
 	}
 	return db
@@ -518,5 +521,287 @@ func assertKiroContentRedacted(t *testing.T, content map[string]any) {
 	}
 	if metadata["refresh_token"] != "[redacted]" || metadata["access_token"] != "[redacted]" {
 		t.Fatalf("nested metadata was not redacted: %+v", metadata)
+	}
+}
+
+type authFilesRefreshTestExecutor struct {
+	calls   int
+	err     error
+	updates map[string]any
+}
+
+func (e *authFilesRefreshTestExecutor) Identifier() string { return "kiro" }
+
+func (e *authFilesRefreshTestExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *authFilesRefreshTestExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *authFilesRefreshTestExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	e.calls++
+	if e.err != nil {
+		return nil, e.err
+	}
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	for key, value := range e.updates {
+		updated.Metadata[key] = value
+	}
+	return updated, nil
+}
+
+func (e *authFilesRefreshTestExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *authFilesRefreshTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestAuthFileListAndGetIncludeDerivedHealth(t *testing.T) {
+	db := openAuthFilesTestDB(t)
+	row := models.Auth{
+		Key: "health-list-auth",
+		Content: datatypes.JSON([]byte(`{
+			"type":"kiro",
+			"refresh_token":"refresh-secret",
+			"access_token":"access-secret",
+			"expires_at":"2999-01-01T00:00:00Z"
+		}`)),
+		IsAvailable: true,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	if errCreate := db.Create(&row).Error; errCreate != nil {
+		t.Fatalf("create auth row: %v", errCreate)
+	}
+
+	gin.SetMode(gin.TestMode)
+	handler := NewAuthFileHandler(db)
+
+	listReq := httptest.NewRequest(http.MethodGet, "/v0/admin/auth-files", nil)
+	listRecorder := httptest.NewRecorder()
+	listCtx, _ := gin.CreateTestContext(listRecorder)
+	listCtx.Request = listReq
+	handler.List(listCtx)
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status = %d: %s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var listResponse struct {
+		AuthFiles []struct {
+			AuthHealth map[string]any `json:"auth_health"`
+		} `json:"auth_files"`
+	}
+	if errDecode := json.Unmarshal(listRecorder.Body.Bytes(), &listResponse); errDecode != nil {
+		t.Fatalf("decode list response: %v", errDecode)
+	}
+	if len(listResponse.AuthFiles) != 1 {
+		t.Fatalf("auth_files length = %d, want 1", len(listResponse.AuthFiles))
+	}
+	if got := listResponse.AuthFiles[0].AuthHealth["state"]; got != authHealthStateHealthy {
+		t.Fatalf("list auth_health.state = %v, want %s: %+v", got, authHealthStateHealthy, listResponse.AuthFiles[0].AuthHealth)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/admin/auth-files/%d", row.ID), nil)
+	getRecorder := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRecorder)
+	getCtx.Request = getReq
+	getCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", row.ID)}}
+	handler.Get(getCtx)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("get status = %d: %s", getRecorder.Code, getRecorder.Body.String())
+	}
+	var getResponse struct {
+		AuthHealth map[string]any `json:"auth_health"`
+	}
+	if errDecode := json.Unmarshal(getRecorder.Body.Bytes(), &getResponse); errDecode != nil {
+		t.Fatalf("decode get response: %v", errDecode)
+	}
+	if got := getResponse.AuthHealth["state"]; got != authHealthStateHealthy {
+		t.Fatalf("get auth_health.state = %v, want %s: %+v", got, authHealthStateHealthy, getResponse.AuthHealth)
+	}
+}
+
+func TestLivenessCheckDoesNotMutateAuthContent(t *testing.T) {
+	db := openAuthFilesTestDB(t)
+	originalContent := datatypes.JSON([]byte(`{
+		"type":"kiro",
+		"refresh_token":"refresh-old",
+		"access_token":"access-old",
+		"expires_at":"2999-01-01T00:00:00Z"
+	}`))
+	row := models.Auth{
+		Key:         "liveness-auth",
+		Content:     originalContent,
+		IsAvailable: false,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	if errCreate := db.Create(&row).Error; errCreate != nil {
+		t.Fatalf("create auth row: %v", errCreate)
+	}
+	if errUpdate := db.Model(&models.Auth{}).Where("id = ?", row.ID).Update("is_available", false).Error; errUpdate != nil {
+		t.Fatalf("mark auth unavailable: %v", errUpdate)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &authFilesRefreshTestExecutor{}
+	manager.RegisterExecutor(executor)
+
+	gin.SetMode(gin.TestMode)
+	handler := NewAuthFileHandler(db, manager)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v0/admin/auth-files/%d/liveness-check", row.ID), nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", row.ID)}}
+
+	handler.LivenessCheck(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if executor.calls != 0 {
+		t.Fatalf("liveness called refresh %d times", executor.calls)
+	}
+	var updated models.Auth
+	if errFind := db.First(&updated, row.ID).Error; errFind != nil {
+		t.Fatalf("find auth row: %v", errFind)
+	}
+	if !jsonEqual(updated.Content, originalContent) {
+		t.Fatalf("auth content changed: got %s want %s", string(updated.Content), string(originalContent))
+	}
+	if updated.IsAvailable {
+		t.Fatalf("liveness marked unavailable auth available")
+	}
+	var response struct {
+		AuthHealth map[string]any `json:"auth_health"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got := response.AuthHealth["state"]; got != authHealthStateHealthy {
+		t.Fatalf("auth_health.state = %v, want %s: %+v", got, authHealthStateHealthy, response.AuthHealth)
+	}
+}
+
+func TestRefreshPersistsTokensRecordsHealthAndPreservesAvailability(t *testing.T) {
+	db := openAuthFilesTestDB(t)
+	row := models.Auth{
+		Key: "refresh-auth",
+		Content: datatypes.JSON([]byte(`{
+			"type":"kiro",
+			"refresh_token":"refresh-old",
+			"access_token":"access-old",
+			"expires_at":"2000-01-01T00:00:00Z"
+		}`)),
+		IsAvailable: false,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	if errCreate := db.Create(&row).Error; errCreate != nil {
+		t.Fatalf("create auth row: %v", errCreate)
+	}
+	if errUpdate := db.Model(&models.Auth{}).Where("id = ?", row.ID).Update("is_available", false).Error; errUpdate != nil {
+		t.Fatalf("mark auth unavailable: %v", errUpdate)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &authFilesRefreshTestExecutor{updates: map[string]any{
+		"access_token":  "access-new",
+		"refresh_token": "refresh-new",
+		"expires_at":    "2999-01-01T00:00:00Z",
+	}}
+	manager.RegisterExecutor(executor)
+
+	gin.SetMode(gin.TestMode)
+	handler := NewAuthFileHandler(db, manager)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v0/admin/auth-files/%d/refresh", row.ID), nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", row.ID)}}
+
+	handler.Refresh(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if executor.calls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", executor.calls)
+	}
+	var updated models.Auth
+	if errFind := db.First(&updated, row.ID).Error; errFind != nil {
+		t.Fatalf("find auth row: %v", errFind)
+	}
+	if updated.IsAvailable {
+		t.Fatalf("refresh marked unavailable auth available")
+	}
+	var content map[string]any
+	if errUnmarshal := json.Unmarshal(updated.Content, &content); errUnmarshal != nil {
+		t.Fatalf("unmarshal content: %v", errUnmarshal)
+	}
+	if content["access_token"] != "access-new" || content["refresh_token"] != "refresh-new" {
+		t.Fatalf("content tokens not refreshed: %+v", content)
+	}
+	if auth, ok := manager.GetByID(row.Key); ok || auth != nil {
+		t.Fatalf("unavailable auth was loaded into runtime: %+v", auth)
+	}
+	var quotaRow models.Quota
+	if errFind := db.Where("auth_id = ? AND type = ?", row.ID, "kiro").First(&quotaRow).Error; errFind != nil {
+		t.Fatalf("find quota health: %v", errFind)
+	}
+	_, status := quotapkg.UnwrapStoredQuotaData(quotaRow.Data)
+	if status == nil || status.State != authHealthStateHealthy || status.NeedsRelogin {
+		t.Fatalf("quota auth status = %+v, want healthy", status)
+	}
+}
+
+func TestRefreshFailureDoesNotMutateAuthContent(t *testing.T) {
+	db := openAuthFilesTestDB(t)
+	originalContent := datatypes.JSON([]byte(`{"type":"kiro","refresh_token":"refresh-old","access_token":"access-old"}`))
+	row := models.Auth{
+		Key:         "refresh-fail-auth",
+		Content:     originalContent,
+		IsAvailable: true,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	if errCreate := db.Create(&row).Error; errCreate != nil {
+		t.Fatalf("create auth row: %v", errCreate)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&authFilesRefreshTestExecutor{err: fmt.Errorf("upstream rejected refresh")})
+
+	gin.SetMode(gin.TestMode)
+	handler := NewAuthFileHandler(db, manager)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v0/admin/auth-files/%d/refresh", row.ID), nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", row.ID)}}
+
+	handler.Refresh(ctx)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var updated models.Auth
+	if errFind := db.First(&updated, row.ID).Error; errFind != nil {
+		t.Fatalf("find auth row: %v", errFind)
+	}
+	if !jsonEqual(updated.Content, originalContent) {
+		t.Fatalf("auth content changed after failed refresh: got %s want %s", string(updated.Content), string(originalContent))
+	}
+	var quotaRow models.Quota
+	if errFind := db.Where("auth_id = ? AND type = ?", row.ID, "kiro").First(&quotaRow).Error; errFind != nil {
+		t.Fatalf("find quota health: %v", errFind)
+	}
+	_, status := quotapkg.UnwrapStoredQuotaData(quotaRow.Data)
+	if status == nil || status.State != authHealthStateRefreshFailed {
+		t.Fatalf("quota auth status = %+v, want refresh_failed", status)
 	}
 }

@@ -2,13 +2,14 @@ import { Link } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { useTranslation } from 'react-i18next';
 import { LanguageSwitcher } from '../components/LanguageSwitcher';
-import { useSiteName } from '../utils/siteName';
+import { usePublicConfig } from '../utils/siteName';
 
 const techStack = ['GPT-5.2', 'Claude 4.5', 'Gemini 3', 'Qwen 3', 'GLM 4.7'];
 
 export function Homepage() {
     const { t } = useTranslation();
-    const siteName = useSiteName();
+    const { siteName, portalRegistrationEnabled, loading: publicConfigLoading } = usePublicConfig();
+    const showRegistrationLink = !publicConfigLoading && portalRegistrationEnabled;
     const features = [
         {
             key: 'latency',
@@ -83,12 +84,14 @@ export function Homepage() {
                                     >
                                         {t('Login')}
                                     </Link>
-                                    <Link
-                                        to="/register"
-                                        className="flex items-center justify-center rounded-lg h-9 px-4 bg-primary hover:bg-blue-600 text-white text-sm font-bold shadow-lg shadow-primary/25 transition-all transform hover:scale-105"
-                                    >
-                                        {t('Get Started')}
-                                    </Link>
+                                    {showRegistrationLink ? (
+                                        <Link
+                                            to="/register"
+                                            className="flex items-center justify-center rounded-lg h-9 px-4 bg-primary hover:bg-blue-600 text-white text-sm font-bold shadow-lg shadow-primary/25 transition-all transform hover:scale-105"
+                                        >
+                                            {t('Get Started')}
+                                        </Link>
+                                    ) : null}
                                     <LanguageSwitcher variant="dark" />
                                 </div>
                             </div>
@@ -150,10 +153,12 @@ export function Homepage() {
                             {/* CTAs */}
                             <div className="flex flex-col sm:flex-row gap-4 mt-4 w-full justify-center">
                                 <Link
-                                    to="/register"
+                                    to={showRegistrationLink ? '/register' : '/login'}
                                     className="group relative flex items-center justify-center h-14 px-8 rounded-lg bg-primary hover:bg-blue-600 text-white text-base font-bold tracking-wide transition-all shadow-[0_0_20px_rgba(19,91,236,0.3)] hover:shadow-[0_0_30px_rgba(19,91,236,0.5)] overflow-hidden"
                                 >
-                                    <span className="mr-2">{t('Start Integration')}</span>
+                                    <span className="mr-2">
+                                        {showRegistrationLink ? t('Start Integration') : t('Sign In')}
+                                    </span>
                                     <Icon
                                         name="arrow_forward"
                                         size={16}

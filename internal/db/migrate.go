@@ -89,6 +89,9 @@ func migratePostgres(conn *gorm.DB) error {
 	if errSeed := ensureOnlyMappedModelsSetting(conn); errSeed != nil {
 		return errSeed
 	}
+	if errSeed := ensurePortalRegistrationSetting(conn); errSeed != nil {
+		return errSeed
+	}
 	if errSeed := ensureQuotaPollSettings(conn); errSeed != nil {
 		return errSeed
 	}
@@ -909,6 +912,9 @@ func migrateSQLite(conn *gorm.DB) error {
 		return errSeed
 	}
 	if errSeed := ensureOnlyMappedModelsSetting(conn); errSeed != nil {
+		return errSeed
+	}
+	if errSeed := ensurePortalRegistrationSetting(conn); errSeed != nil {
 		return errSeed
 	}
 	if errSeed := ensureQuotaPollSettings(conn); errSeed != nil {
@@ -1751,6 +1757,15 @@ func ensureQuotaPollSettings(conn *gorm.DB) error {
 		return errEnsure
 	}
 	return nil
+}
+
+// ensurePortalRegistrationSetting ensures PORTAL_REGISTRATION_ENABLED exists with defaults.
+func ensurePortalRegistrationSetting(conn *gorm.DB) error {
+	return ensureBoolSetting(
+		conn,
+		internalsettings.PortalRegistrationEnabledKey,
+		internalsettings.DefaultPortalRegistrationEnabled,
+	)
 }
 
 // ensureAutoAssignProxySetting ensures AUTO_ASSIGN_PROXY exists with defaults.
