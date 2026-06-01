@@ -31,6 +31,85 @@ func newCodexSignatureTestAuth(serverURL string) *cliproxyauth.Auth {
 	}}
 }
 
+func TestStripCodexUnsupportedResponseParams(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5.4",
+		"max_tokens": 100,
+		"max_output_tokens": 200,
+		"max_completion_tokens": 300,
+		"temperature": 0.2,
+		"top_p": 0.8,
+		"truncation": "auto",
+		"service_tier": "default",
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	out := stripCodexUnsupportedResponseParams(body)
+	for _, path := range []string{"max_tokens", "max_output_tokens", "max_completion_tokens", "temperature", "top_p", "truncation", "service_tier"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be stripped: %s", path, string(out))
+		}
+	}
+
+	out = stripCodexUnsupportedResponseParams([]byte(`{"service_tier":"priority"}`))
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want priority; body=%s", got, string(out))
+	}
+}
+
+func TestCodexExecutorPayloadRulesCannotReintroduceUnsupportedResponseParams(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{
+						{Name: "gpt-5.4", Protocol: "codex", FromProtocol: "responses"},
+					},
+					Params: map[string]any{
+						"max_tokens":            100,
+						"max_output_tokens":     200,
+						"max_completion_tokens": 300,
+						"temperature":           0.2,
+						"top_p":                 0.8,
+						"truncation":            "auto",
+						"service_tier":          "default",
+					},
+				},
+			},
+		},
+	})
+	_, err := executor.Execute(context.Background(), newCodexSignatureTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","max_tokens":50,"input":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if len(gotBody) == 0 {
+		t.Fatal("upstream body was not captured")
+	}
+	for _, path := range []string{"max_tokens", "max_output_tokens", "max_completion_tokens", "temperature", "top_p", "truncation", "service_tier"} {
+		if gjson.GetBytes(gotBody, path).Exists() {
+			t.Fatalf("%s should not reach Codex upstream after payload rules: %s", path, string(gotBody))
+		}
+	}
+}
+
 func TestCodexExecutorDropsInvalidReasoningEncryptedContentFromFinalRequest(t *testing.T) {
 	validEncryptedContent := validCodexReasoningEncryptedContentForTest()
 	var gotBody []byte

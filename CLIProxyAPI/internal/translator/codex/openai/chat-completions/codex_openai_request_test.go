@@ -6,6 +6,25 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestChatCompletionsTokenLimitsNotForwardedToCodex(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "hello"}
+		],
+		"max_tokens": 100,
+		"max_completion_tokens": 200
+	}`)
+
+	output := ConvertOpenAIRequestToCodex("gpt-5.2", input, false)
+
+	for _, path := range []string{"max_tokens", "max_output_tokens", "max_completion_tokens"} {
+		if gjson.GetBytes(output, path).Exists() {
+			t.Fatalf("%s should not be emitted for Codex chat completions conversion: %s", path, string(output))
+		}
+	}
+}
+
 // Basic tool-call: system + user + assistant(tool_calls, no content) + tool result.
 // Expects developer msg + user msg + function_call + function_call_output.
 // No empty assistant message should appear between user and function_call.

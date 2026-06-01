@@ -364,3 +364,21 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
 }
+
+func TestTokenLimitFieldsRemovedForCodexCompatibility(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"max_tokens": 100,
+		"max_output_tokens": 200,
+		"max_completion_tokens": 300,
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	for _, path := range []string{"max_tokens", "max_output_tokens", "max_completion_tokens"} {
+		if gjson.GetBytes(output, path).Exists() {
+			t.Fatalf("%s should be removed for Codex compatibility: %s", path, string(output))
+		}
+	}
+}
